@@ -1,0 +1,25 @@
+---
+description: Commit and push nested repos (cpp_programs, python_programs, security) from programming root
+alwaysApply: true
+---
+
+# Multi-repo root (`programming/`)
+
+This folder is a **parent git repo** whose tracked paths `cpp_programs/`, `python_programs/`, and `security/` are **separate nested git repositories** (gitlinks). File changes must be committed **inside each nested repo first**, then the **parent** commit updates the pointers.
+
+## When the user asks to sync / commit / push “all repos” or “from the root”
+
+**Short phrases count:** *“commit all”*, *“checkin all”*, *“check in all”* (and casual variants like *“commit everything”*) mean the nested-repo workflow from this root—**commit only**, unless they also say *push*.
+
+Treat these as the same intent for **commit** (add **push** only if they say push / sync to remote): *“commit all three repos from the root”*, *“sync all repos”*, *“check in everything”*, *“check in everything and push”*, *“run the multi-repo commit”*.
+
+1. For each of `cpp_programs`, `python_programs`, `security` (in that order): `git add -A`, `git status`, `git commit` **only if** there is something to commit. Use a clear message; if the user gave one message, use it per repo with a suffix like `(cpp_programs)` or ask once for separate messages if they prefer.
+2. At the parent: `git add cpp_programs python_programs security` and `git commit` if any gitlink changed.
+3. If they asked to **push**: push **nested repos first** (`git push` in each), then `git push` at the parent. Request `git_write` and `network` / `full_network` as needed.
+
+Optional: run `./commit-all-repos.sh` from the repo root if it exists; use `--push` when they want push.
+
+## Do not
+
+- Expect a single `git commit` at the root to record file edits inside nested repos.
+- Commit `.DS_Store` unless the project already tracks it.
