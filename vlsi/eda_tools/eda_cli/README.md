@@ -1,5 +1,5 @@
 # eda_cli — Standalone EDA Command-Line Gateway
-# Cross-reference: ../vlsi_agent_python/ARCHITECTURE.md
+# Cross-reference: ../../docs/agent/architecture.md
 
 ## What This Project Is
 
