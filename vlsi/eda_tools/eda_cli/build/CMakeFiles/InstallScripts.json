@@ -1,0 +1,10 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/cmake_install.cmake",
+		"/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-build/cmake_install.cmake",
+		"/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router/cmake_install.cmake",
+		"/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_placer/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

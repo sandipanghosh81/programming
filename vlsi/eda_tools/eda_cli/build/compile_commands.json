@@ -1,0 +1,92 @@
+[
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/../eda_router/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/../eda_placer/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/../eda_router/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/eda_daemon.dir/src/main.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/src/main.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/src/main.cpp",
+  "output": "CMakeFiles/eda_daemon.dir/src/main.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/../eda_router/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/../eda_placer/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/../eda_router/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/eda_daemon.dir/src/eda_daemon.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/src/eda_daemon.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/src/eda_daemon.cpp",
+  "output": "CMakeFiles/eda_daemon.dir/src/eda_daemon.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++  -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/routing_genetic_astar_io.dir/src/io/def_design_loader.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/io/def_design_loader.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/io/def_design_loader.cpp",
+  "output": "eda_router/CMakeFiles/routing_genetic_astar_io.dir/src/io/def_design_loader.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++  -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/routing_genetic_astar_io.dir/src/planner/grid_fill.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/planner/grid_fill.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/planner/grid_fill.cpp",
+  "output": "eda_router/CMakeFiles/routing_genetic_astar_io.dir/src/planner/grid_fill.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/vlsi_daemon.dir/src/vlsi_daemon.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/vlsi_daemon.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/vlsi_daemon.cpp",
+  "output": "eda_router/CMakeFiles/vlsi_daemon.dir/src/vlsi_daemon.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/vlsi_daemon.dir/src/routing_pipeline.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/routing_pipeline.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/src/routing_pipeline.cpp",
+  "output": "eda_router/CMakeFiles/vlsi_daemon.dir/src/routing_pipeline.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_grid_graph.dir/tests/test_grid_graph.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_grid_graph.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_grid_graph.cpp",
+  "output": "eda_router/CMakeFiles/test_grid_graph.dir/tests/test_grid_graph.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_design_analyzer.dir/tests/test_design_analyzer.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_design_analyzer.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_design_analyzer.cpp",
+  "output": "eda_router/CMakeFiles/test_design_analyzer.dir/tests/test_design_analyzer.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_global_planner.dir/tests/test_global_planner.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_global_planner.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_global_planner.cpp",
+  "output": "eda_router/CMakeFiles/test_global_planner.dir/tests/test_global_planner.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_detailed_grid_router.dir/tests/test_detailed_grid_router.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_detailed_grid_router.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_detailed_grid_router.cpp",
+  "output": "eda_router/CMakeFiles/test_detailed_grid_router.dir/tests/test_detailed_grid_router.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_convergence_monitor.dir/tests/test_convergence_monitor.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_convergence_monitor.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_convergence_monitor.cpp",
+  "output": "eda_router/CMakeFiles/test_convergence_monitor.dir/tests/test_convergence_monitor.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_router",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_strategy_composer.dir/tests/test_strategy_composer.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_strategy_composer.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_router/tests/test_strategy_composer.cpp",
+  "output": "eda_router/CMakeFiles/test_strategy_composer.dir/tests/test_strategy_composer.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_placer",
+  "command": "/usr/bin/c++  -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/../eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/eda_placer.dir/src/analytical_placer.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/src/analytical_placer.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/src/analytical_placer.cpp",
+  "output": "eda_placer/CMakeFiles/eda_placer.dir/src/analytical_placer.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_placer",
+  "command": "/usr/bin/c++  -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/../eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/eda_placer.dir/src/analog_placer.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/src/analog_placer.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/src/analog_placer.cpp",
+  "output": "eda_placer/CMakeFiles/eda_placer.dir/src/analog_placer.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_cli/build/eda_placer",
+  "command": "/usr/bin/c++  -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/include -I/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/../eda_router/include -I/Users/sandipanghosh/programming/cpp_programs/eda_cli/build/_deps/nlohmann_json-src/include -O3 -DNDEBUG -std=gnu++23 -arch arm64 -o CMakeFiles/test_analog_placer.dir/tests/test_analog_placer.cpp.o -c /Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/tests/test_analog_placer.cpp",
+  "file": "/Users/sandipanghosh/programming/vlsi/eda_tools/eda_placer/tests/test_analog_placer.cpp",
+  "output": "eda_placer/CMakeFiles/test_analog_placer.dir/tests/test_analog_placer.cpp.o"
+}
+]

@@ -1,0 +1,56 @@
+[
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/vlsi_daemon.dir/src/vlsi_daemon.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/src/vlsi_daemon.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/src/vlsi_daemon.cpp",
+  "output": "CMakeFiles/vlsi_daemon.dir/src/vlsi_daemon.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/vlsi_daemon.dir/src/routing_pipeline.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/src/routing_pipeline.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/src/routing_pipeline.cpp",
+  "output": "CMakeFiles/vlsi_daemon.dir/src/routing_pipeline.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/vlsi_daemon.dir/src/planner/grid_fill.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/src/planner/grid_fill.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/src/planner/grid_fill.cpp",
+  "output": "CMakeFiles/vlsi_daemon.dir/src/planner/grid_fill.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/test_grid_graph.dir/tests/test_grid_graph.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_grid_graph.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_grid_graph.cpp",
+  "output": "CMakeFiles/test_grid_graph.dir/tests/test_grid_graph.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/test_design_analyzer.dir/tests/test_design_analyzer.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_design_analyzer.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_design_analyzer.cpp",
+  "output": "CMakeFiles/test_design_analyzer.dir/tests/test_design_analyzer.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/test_global_planner.dir/tests/test_global_planner.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_global_planner.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_global_planner.cpp",
+  "output": "CMakeFiles/test_global_planner.dir/tests/test_global_planner.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/test_detailed_grid_router.dir/tests/test_detailed_grid_router.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_detailed_grid_router.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_detailed_grid_router.cpp",
+  "output": "CMakeFiles/test_detailed_grid_router.dir/tests/test_detailed_grid_router.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/test_convergence_monitor.dir/tests/test_convergence_monitor.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_convergence_monitor.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_convergence_monitor.cpp",
+  "output": "CMakeFiles/test_convergence_monitor.dir/tests/test_convergence_monitor.cpp.o"
+},
+{
+  "directory": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build",
+  "command": "/usr/bin/c++ -DBOOST_BEAST_USE_STD_STRING_VIEW -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/include -I/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-src/include -isystem /opt/homebrew/include -g -std=gnu++23 -arch arm64 -o CMakeFiles/test_strategy_composer.dir/tests/test_strategy_composer.cpp.o -c /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_strategy_composer.cpp",
+  "file": "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/tests/test_strategy_composer.cpp",
+  "output": "CMakeFiles/test_strategy_composer.dir/tests/test_strategy_composer.cpp.o"
+}
+]

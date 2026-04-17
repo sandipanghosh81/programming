@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "cpp_programs"
+		},
+		{
+			"path": "python_programs"
+		}
+	],
+	"settings": {
+		"workbench.editorAssociations": {
+			"*.md": "vscode.markdown.preview.editor"
+		}
+	}
+}

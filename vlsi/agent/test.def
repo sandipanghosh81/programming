@@ -1,0 +1,15 @@
+VERSION 5.8 ;
+DESIGN demo_chip ;
+UNITS DISTANCE MICRONS 1000 ;
+DIEAREA ( 0 0 ) ( 50000 50000 ) ;
+COMPONENTS 3 ;
+- U1 NAND2 + PLACED ( 5000 5000 ) N ;
+- U2 INV + PLACED ( 15000 12000 ) FS ;
+- U3 BUF + PLACED ( 30000 25000 ) N ;
+END COMPONENTS
+NETS 3 ;
+- clk ( PIN clk ) ( U1 A ) ( U2 Z ) ;
+- data_in ( PIN din ) ( U1 B ) ( U3 A ) ;
+- VDD ( U1 VDD ) ( U2 VDD ) ( U3 VDD ) ;
+END NETS
+END DESIGN

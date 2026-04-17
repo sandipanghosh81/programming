@@ -1,0 +1,2 @@
+/usr/bin/ar qc libeda_placer.a CMakeFiles/eda_placer.dir/src/analytical_placer.cpp.o CMakeFiles/eda_placer.dir/src/analog_placer.cpp.o
+/usr/bin/ranlib libeda_placer.a

@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/cmake_install.cmake",
+		"/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/_deps/nlohmann_json-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

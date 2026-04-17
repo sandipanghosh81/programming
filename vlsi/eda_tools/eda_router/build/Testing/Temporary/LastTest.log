@@ -1,0 +1,287 @@
+Start testing: Apr 13 12:36 PDT
+----------------------------------------------------------
+1/6 Testing: test_grid_graph
+1/6 Test: test_grid_graph
+Command: "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/test_grid_graph"
+Directory: /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build
+"test_grid_graph" start time: Apr 13 12:36 PDT
+Output:
+----------------------------------------------------------
+═══════════════════════════════════════════════════════
+ TEST SUITE: RoutingGridGraph (grid_graph.hpp)
+═══════════════════════════════════════════════════════
+
+[TEST 1] build_lattice: vertex and edge counts
+  PASS: 3×3×2 grid has 18 vertices
+  PASS: 3×3×2 grid has 33 edges (12 horizontal + 12 vertical + 9 via)
+  ✓ vertex and edge counts
+
+[TEST 2] vertex_at: coordinate lookup
+  PASS: vertex_at(0,0,0) has correct position
+  PASS: vertex_at(4,3,1) has correct position
+  PASS: origin is in bounds
+  PASS: x=5 is out of bounds for cols=5
+  ✓ vertex_at coordinate lookup
+
+[TEST 3] edge_between: std::optional edge lookup
+  PASS: edge between (0,0,0)→(1,0,0) exists (adjacent)
+  PASS: no direct edge between (0,0,0)→(2,0,0) (2-hop)
+  PASS: horizontal edge has w_base = 1.0 (preferred track weight)
+  ✓ edge_between optional
+
+[TEST 4] try_claim_edge and release_net
+  PASS: edge is free initially (owner=-1)
+  PASS: first claim by net 42 succeeds
+  PASS: edge now owned by net 42
+  PASS: second claim by net 99 fails (conflict detected)
+  PASS: edge still owned by net 42 after conflict
+  PASS: gcell demand at source vertex incremented to 1.0
+  PASS: edge is free after release_net(42)
+  PASS: gcell demand reset after rip-up
+  ✓ try_claim and release_net
+
+[TEST 5] freeze_net: ECO route locking
+  PASS: edge is frozen after freeze_net(7)
+  PASS: cannot claim a frozen edge
+  PASS: frozen edge retains owner after release_net
+  PASS: frozen edge stays frozen after release_net
+  ✓ freeze_net ECO flow
+
+[TEST 6] gcell_overflow and total_overflow
+  PASS: no overflow initially
+  PASS: zero total overflow initially
+  PASS: overflow = demand(2.0) - capacity(1.0) = 1.0 after 2 claims
+  PASS: total overflow is non-zero after over-subscription
+  ✓ gcell_overflow calculation
+
+═══════════════════════════════════════════════════════
+ Results: 6 passed, 0 failed.
+═══════════════════════════════════════════════════════
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_grid_graph" end time: Apr 13 12:36 PDT
+"test_grid_graph" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/6 Testing: test_design_analyzer
+2/6 Test: test_design_analyzer
+Command: "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/test_design_analyzer"
+Directory: /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build
+"test_design_analyzer" start time: Apr 13 12:36 PDT
+Output:
+----------------------------------------------------------
+═══════════════════════════════════════════════════════
+ TEST SUITE: DesignAnalyzer (design_analyzer.hpp)
+═══════════════════════════════════════════════════════
+
+[TEST 1] Memory array classification
+  PASS: analyze() returned a value (no error)
+  PASS: dense uniform 2-pin nets classified as MemoryArrayTag
+  PASS: avg_fanout = 2.0
+  PASS: total_nets = 40
+
+[TEST 2] Clock network classification
+  PASS: analyze() succeeded
+  PASS: 64-sink net classified as ClockNetworkTag
+  PASS: max_fanout = 64.0
+
+[TEST 3] Random logic classification
+  PASS: analyze() succeeded
+  PASS: normal fanout design classified as RandomLogicTag
+
+[TEST 4] Error cases
+  PASS: empty netlist returns error
+  PASS: error message is non-empty
+  PASS: zero rows returns error
+
+[TEST 5] std::span interface generality
+  PASS: analyze() works with std::span of raw array
+  PASS: total_nets = 3 from raw array view
+
+ Results: 5 passed, 0 failed.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_design_analyzer" end time: Apr 13 12:36 PDT
+"test_design_analyzer" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/6 Testing: test_global_planner
+3/6 Test: test_global_planner
+Command: "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/test_global_planner"
+Directory: /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build
+"test_global_planner" start time: Apr 13 12:36 PDT
+Output:
+----------------------------------------------------------
+═══════════════════════════════════════════════════════
+ TEST SUITE: GlobalPlanner (global_planner.hpp)
+═══════════════════════════════════════════════════════
+
+[TEST 1] GA produces one corridor per net
+  PASS: plan() returned a value (no error)
+  PASS: exactly 5 corridors (one per net)
+  PASS: corridor net_id matches net index
+  PASS: corridor net_id matches net index
+  PASS: corridor net_id matches net index
+  PASS: corridor net_id matches net index
+  PASS: corridor net_id matches net index
+
+[TEST 2] MemoryArrayTag bypasses GA and uses GridFill
+  PASS: GridFill path returned successfully
+  PASS: 8 corridors from GridFill
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+  PASS: corridor is_memory_array = true (GridFill assigned)
+
+[TEST 3] Empty netlist returns PlannerError
+  PASS: plan() returns error for empty netlist
+  PASS: error reason string is not empty
+    Error reason: "GlobalPlanner: design has no nets"
+
+[TEST 4] Fitness value is finite after GA
+  PASS: plan() succeeded
+  PASS: fitness value is finite (not NaN or inf)
+  PASS: fitness is non-negative
+    Best fitness after 10 generations: 0
+
+ Results: 4 passed, 0 failed.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_global_planner" end time: Apr 13 12:36 PDT
+"test_global_planner" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/6 Testing: test_detailed_grid_router
+4/6 Test: test_detailed_grid_router
+Command: "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/test_detailed_grid_router"
+Directory: /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build
+"test_detailed_grid_router" start time: Apr 13 12:36 PDT
+Output:
+----------------------------------------------------------
+═══════════════════════════════════════════════════════
+ TEST SUITE: DetailedGridRouter (detailed_grid_router.hpp)
+═══════════════════════════════════════════════════════
+
+[TEST 1] A* routes adjacent vertices (1-hop)
+  PASS: path is non-empty for adjacent vertices
+  PASS: path starts at source
+  PASS: path ends at destination
+  PASS: adjacent path has exactly 2 vertices
+  PASS: edge exists between adjacent vertices
+  PASS: edge claimed by net 0 after routing
+
+[TEST 2] A* routes across 5 columns
+  PASS: path found across 5 columns
+  PASS: path starts at (0,0,0)
+  PASS: path ends at (5,0,0)
+  PASS: shortest 5-hop path has 6 vertices
+
+[TEST 3] Corridor bbox clamp prevents out-of-corridor routing
+  PASS: A* returns empty path when destination is outside corridor
+
+[TEST 4] DRC mask blocks A* expansion
+  PASS: A* returns empty when all eastward paths are DRC-blocked
+
+[TEST 5] A* uses via edges to route to a different layer
+  PASS: A* routes between layers using via edge
+  PASS: via route has exactly 2 vertices (src + dst)
+  PASS: path starts at layer 0 vertex
+  PASS: path ends at layer 1 vertex
+
+ Results: 5 passed, 0 failed.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_detailed_grid_router" end time: Apr 13 12:36 PDT
+"test_detailed_grid_router" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/6 Testing: test_convergence_monitor
+5/6 Test: test_convergence_monitor
+Command: "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/test_convergence_monitor"
+Directory: /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build
+"test_convergence_monitor" start time: Apr 13 12:36 PDT
+Output:
+----------------------------------------------------------
+═══════════════════════════════════════════════════════
+ TEST SUITE: ConvergenceMonitor (convergence_monitor.hpp)
+═══════════════════════════════════════════════════════
+
+[TEST 1] is_converged() triggers on zero conflicts
+  PASS: not converged after 10 conflicts
+  PASS: converged after conflict_count=0
+  PASS: not oscillating when converged
+
+[TEST 2] is_oscillating() triggers on narrow conflict band
+  PASS: not converged (conflicts > 0)
+  PASS: oscillating after 4 passes with max-min = 1 < threshold 2.0
+
+[TEST 3] Ring buffer drops old passes after window_size
+  PASS: not oscillating with wide conflict range [1,100]
+  PASS: oscillating after window fills with constant 5
+
+[TEST 4] isolate_oscillating_region builds subregion bbox
+  PASS: oscillating as expected
+  PASS: subregion is present when oscillating
+  PASS: bbox x range covers conflict columns 2..5
+  PASS: bbox y range covers conflict rows 3..5
+  PASS: net 7 is in oscillating subregion
+  PASS: net 8 is in oscillating subregion
+
+ Results: 4 passed, 0 failed.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_convergence_monitor" end time: Apr 13 12:36 PDT
+"test_convergence_monitor" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/6 Testing: test_strategy_composer
+6/6 Test: test_strategy_composer
+Command: "/Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build/test_strategy_composer"
+Directory: /Users/sandipanghosh/programming/cpp_programs/routing_genetic_astar/build
+"test_strategy_composer" start time: Apr 13 12:36 PDT
+Output:
+----------------------------------------------------------
+═══════════════════════════════════════════════════════
+ TEST SUITE: StrategyComposer (strategy_composer.hpp)
+═══════════════════════════════════════════════════════
+
+[TEST 1] RandomLogicTag + 2 pins → DetailedGridRouter (direct A*)
+  PASS: 2-pin random logic produces a non-empty path
+  PASS: path starts at pin 0
+  PASS: path ends at pin 1
+
+[TEST 2] ClockNetworkTag + 4 sinks → SpineFishboneRouter (H-tree)
+  PASS: clock H-tree routing produces at least one vertex
+    H-tree produced 5 vertex segments.
+
+[TEST 3] MemoryArrayTag → compose_and_route returns empty (GridFill owns this)
+  PASS: MemoryArrayTag context returns empty path (GridFill owns it)
+
+[TEST 4] RandomLogicTag + 3 pins → TreeRouter (Steiner MST)
+  PASS: 3-pin Steiner routing produces segments
+    Steiner tree produced 15 vertex segments.
+
+ Results: 4 passed, 0 failed.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_strategy_composer" end time: Apr 13 12:36 PDT
+"test_strategy_composer" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 13 12:36 PDT

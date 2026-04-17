@@ -1,0 +1,7 @@
+test_grid_graph 3 0.000945431
+test_design_analyzer 3 0.000701417
+test_global_planner 3 0.00267225
+test_detailed_grid_router 3 0.00118914
+test_convergence_monitor 2 0.00140102
+test_strategy_composer 3 0.00389885
+---

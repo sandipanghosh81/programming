@@ -1,0 +1,46 @@
+* Source: https://raw.githubusercontent.com/akilm/Standard-Cell-Library-skywater-130/main/Pre-Layout-Simulation/xor3_1x.cir
+* Notes: Added m/nf parameters for multiplicity examples.
+.option scale=1E-6
+.option scale=1E-6
+.include "/home/akil/sky130_fd_pr/models/r+c/res_typical__cap_typical__lin.spice"
+.include "/home/akil/sky130_fd_pr/models/r+c/res_typical__cap_typical.spice"
+.include "/home/akil/sky130_fd_pr/models/corners/tt.spice"
+
+X1 Vdd A N001 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X2 N001 B N002 N001 sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X3 N002 B N003 N003 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+X4 N003 A 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+
+X5 Vdd A N004 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X6 Vdd B N004 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X7 N004 C N002 N004 sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X8 N002 C N005 N005 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+X9 N005 B 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+X10 N005 A 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+
+X11 Vdd A N006 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X12 Vdd B N006 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X13 Vdd C N006 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X14 N006 N002 N007 N006 sky130_fd_pr__pfet_01v8 l=0.18 w=4.6 m=2
+X15 N007 N002 N008 N008 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+X16 N008 A 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+X17 N008 B 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+X18 N008 C 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=2 nf=2
+
+X19 Vdd A N009 Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=6.9 m=2
+X20 N009 B N010 N009 sky130_fd_pr__pfet_01v8 l=0.18 w=6.9 m=2
+X21 N010 C N007 N010 sky130_fd_pr__pfet_01v8 l=0.18 w=6.9 m=2
+X22 N007 A N011 N011 sky130_fd_pr__nfet_01v8 l=0.18 w=6.9 nf=2
+X23 N011 B N012 N012 sky130_fd_pr__nfet_01v8 l=0.18 w=6.9 nf=2
+X24 N012 C 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=6.9 nf=2
+
+X26 Vdd N007 Y Vdd sky130_fd_pr__pfet_01v8 l=0.18 w=2.3 m=2
+X27 Y N007 0 0 sky130_fd_pr__nfet_01v8 l=0.18 w=1 nf=2
+CL N007 0 0.6pF
+
+V1 Vdd 0 1.8
+V2 A 0 PULSE(0 1.8 0 0.06n 0.06n 10.0n 20n)
+V3 B 0 1.8
+V4 C 0 0
+.tran 0.1n 100n
+.end
