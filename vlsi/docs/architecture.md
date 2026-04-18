@@ -35,6 +35,42 @@ This policy is the single source of truth for tool dispatch — see [§4 Tool La
 12. [RAG Memory System](#12-rag-memory-system)
 13. [Docker Deployment](#13-docker-deployment)
 14. [Geometry-Level DRC and Write Protocol](#14-geometry-level-drc-and-write-protocol)
+15. [Graceful Degradation and Failure Modes](#15-graceful-degradation-and-failure-modes)
+16. [Structured Job Tracing](#16-structured-job-tracing)
+17. [Latency Budget](#17-latency-budget)
+
+---
+
+## Maturity Matrix
+
+> **Read this first.** This table distinguishes what exists in the codebase today from what is designed but not yet implemented. Every section in this document uses the same status labels. Anything marked **Planned** has a documented interface and design but zero lines of production code.
+
+| Component | Status | What exists today | Tests |
+|---|---|---|---|
+| **eda_router** static lib (`routing_genetic_astar_io`) | **Exists** — builds, links | `def_design_loader.cpp`, `grid_fill.cpp`, full header tree under `include/routing_genetic_astar/` | 6 CTest executables (grid_graph, design_analyzer, global_planner, detailed_grid_router, convergence_monitor, strategy_composer) + smoke_test.sh |
+| **eda_placer** static lib | **Exists** — builds, links | `analog_placer.cpp`, `analytical_placer.cpp` | 1 CTest (test_analog_placer) |
+| **eda_daemon** (JSON-RPC gateway) | **Exists** — builds, links | `eda_daemon.cpp`, `main.cpp`; links `eda_router_io` + `eda_placer` | Smoke (daemon starts, accepts WS connection) |
+| **vlsi_daemon** (standalone router) | **Exists** — builds, links | `vlsi_daemon.cpp`, `routing_pipeline.cpp` | Shared with eda_router tests |
+| OASIS writer | **Planned** — header interface designed | 0 lines | 0 |
+| Binary delta writer | **Planned** — header interface designed | 0 lines | 0 |
+| Via expander | **Planned** — pseudocode + logic in docs | 0 lines | 0 |
+| LangGraph orchestrator (Graph A) | **Planned** — file map + pseudocode | 0 lines | 0 |
+| Policy router | **Planned** — state machine + pseudocode | 0 lines | 0 |
+| HEA — Virtuoso (SKILL) | **Planned** — pseudocode in §10.5 | 0 lines | 0 |
+| HEA — ICC2 (Tcl) | **Planned** — pseudocode in §10.5 | 0 lines | 0 |
+| HEA — KLayout (Python) | **Planned** — pseudocode in §10.5 | 0 lines | 0 |
+| EU Registry (Jinja2 templates) | **Planned** — directory layout + 2 example templates | 0 deployable templates | 0 |
+| Script Synthesis Node | **Planned** — pseudocode in §10.4 | 0 lines | 0 |
+| Python REPL sandbox | **Planned** — interface described | 0 lines | 0 |
+| RAG Service + Ingestor | **Planned** — architecture in §12 | 0 lines | 0 |
+| ChromaDB config | **Planned** — compose service defined | `docker-compose.yml` service block | 0 |
+| KLayout DRC service | **Planned** — Dockerfile + scripts designed | 0 lines | 0 |
+| DRC script generator | **Planned** — Python template in §14.3 | 0 lines | 0 |
+| Docker multi-stage build | **Planned** — Dockerfile spec in §13 | 0 lines | 0 |
+| Chatbot dock (KLayout PyQt) | **Planned** — file map only | 0 lines | 0 |
+| Constraints MCP tool | **Exists** — runs | `constraints.py`, `mcp_server.py` | Manual |
+
+> **Build priority.** The [Implementation Roadmap](./implementation.md#14-implementation-roadmap) in the companion document defines the build order. The recommended first milestone is: eda_daemon (exists) → binary delta writer → OASIS writer → KLayout DRC service → HEA (one host) → EU compiler (static templates only, no LLM) → basic LangGraph orchestrator. RAG and Script Synthesis are deferred until the core write path is proven end-to-end.
 
 ---
 
@@ -1016,6 +1052,37 @@ Over time the registry grows from actual usage rather than manual authoring. Evi
 - **Not a graph runtime.** The HEA executes scripts; it does not orchestrate them. All conditional logic, retries, and multi-step flow lives in LangGraph.
 - **Not a substitute for layer routing.** The policy router decides *when* to use the internal layer. The EU pattern only defines *how* that layer is implemented.
 
+### 10.9 HEA conformance test suite
+
+The three HEA implementations (Virtuoso/SKILL, ICC2/Tcl, KLayout/Python) share no source code and must be kept in behavioral sync. A conformance test suite validates any HEA implementation against a fixed contract. The tests are host-agnostic — they exercise the MCP interface over WebSocket without knowledge of the underlying scripting language.
+
+**Test runner:** a Python script (`tests/hea/test_hea_conformance.py`) that connects to an HEA on a configurable port and runs each test case as a JSON-RPC call sequence.
+
+| Test case | Sequence | Pass condition |
+|---|---|---|
+| **Ping** | `{"method": "ping"}` | Response: `{"result": "pong"}` within 2s |
+| **Write → Read state** | `write_state({"input.x": 42})` → `query_state(["input.x"])` | Returns `{"input.x": 42}` |
+| **Deploy simple EU** | `write_state({"input.a": 1, "input.b": 2})` → `deploy_eu(add_eu)` → `query_state(["output.sum"])` | `output.sum == 3`; `status == "success"` |
+| **EU timeout** | `deploy_eu(sleep_60s_eu, timeout_s=2)` | `status == "timeout"` within 3s |
+| **EU error handling** | `deploy_eu(divide_by_zero_eu)` | `status == "error"`; `error_detail` non-empty |
+| **State isolation** | Deploy EU1 (sets `output.x`), then deploy EU2 (reads `output.x`) | EU2 reads value written by EU1 without orchestrator mediation |
+| **Stream log** | `deploy_eu(logging_eu, stream=true)` → read `stream_log(eu_id)` | At least 1 log line received before EU completes |
+| **Undo group watchdog** | `deploy_eu(open_undo_group_eu)` → wait 70s → `query_state(["undo_group_open"])` | Watchdog auto-closed the orphaned group; `undo_group_open == false` |
+| **Concurrent EUs rejected** | Deploy EU1 (5s sleep) → immediately deploy EU2 | EU2 returns `error: EU already in flight` (HEA is single-threaded) |
+
+**Test EUs** are trivial scripts shipped alongside the conformance runner:
+
+```python
+# tests/hea/test_eus.py — language-agnostic EU source (Jinja2 templates)
+ADD_EU = {
+    "skill":         'let((a b) a=(euStateGet "input.a") b=(euStateGet "input.b") (euStateSet "output.sum" (a+b)))',
+    "tcl":           'eu_state_set output.sum [expr {[eu_state_get input.a] + [eu_state_get input.b]}]',
+    "klayout_python": 'state_out["output.sum"] = state_in["input.a"] + state_in["input.b"]',
+}
+```
+
+**When to run:** the conformance suite runs against each HEA implementation after every change. It is also the acceptance gate before declaring a new host integration complete. Target: all 9 tests pass within 30s total.
+
 ---
 
 ## 11. Appendices
@@ -1037,8 +1104,10 @@ vlsi/agent/
       eu_compiler.py                   EU Compiler Node
       script_synthesis.py              Script Synthesis Node (RAG → LLM → REPL)
       python_repl.py                   Python REPL sandbox (KLayout-Python dry-run)
+      tracing.py                       @traced decorator + trace event schema (§16)
       policy/
         layer_router.py                internal-first routing policy + RAG tool select
+        static_tool_map.py             Fallback capability→tool mapping (§15.2)
       modules/
         _cli_client.py                 shared WebSocket MCP client (external)
         _hea_client.py                 shared WebSocket MCP client (HEA)
@@ -1068,6 +1137,10 @@ vlsi/agent/
       virtuoso/                        SKILL loader, euStateStore procedures
       icc2/                            Tcl loader, eu_state_store array
       klayout/                         Python loader, PyQt post_runnable wiring
+    tests/
+      hea/
+        test_hea_conformance.py        HEA conformance test runner (§10.9)
+        test_eus.py                    Trivial test EUs (add, sleep, error) per language
     rag/                               RAG memory system
       rag_service.py                   Vector retrieval interface (ChromaDB client)
       ingestor.py                      Chunk + embed vendor docs into ChromaDB
@@ -1244,6 +1317,7 @@ Naming convention: `<tool_slug>_<version_slug>` — no spaces, lowercase. The RA
 | **Data on named volume** | Embeddings lost if volume destroyed | Back up `chroma_data` volume before `docker volume rm` |
 | **Performance above ~1 M vectors** | Query latency degrades | Partition by tool + version; prune old collections after 2 releases |
 | **No built-in versioning** | Cannot diff collections | Enforce version-slug naming; keep N−1 collection as rollback |
+| **Service unavailability** | RAG-assisted tool selection and script synthesis fail | Agent degrades to static capability→tool mapping and registry-only EU mode (see [§15.1](#151-failure-mode-matrix)) |
 
 ### 12.4 RAG retrieval pipeline
 
@@ -1264,6 +1338,7 @@ flowchart LR
 - Embedding model: `text-embedding-3-small` (OpenAI) or `nomic-embed-text` (local, via Ollama)
 - `top_k = 8` for script synthesis, `top_k = 3` for tool selection and chat answers
 - Chunks are ~400 tokens each with 50-token overlap; metadata carries `{host, version, api_name, language}`
+- **Session cache:** RAG results for tool selection are cached by `(capability, host, version)` in `state.rag_cache`. Most routing jobs in a session hit the same capability/host, so the cache eliminates repeated ChromaDB queries. Cache is invalidated when `state.eda_version` changes. See [§17 Latency Budget](#17-latency-budget) for the impact.
 
 ### 12.5 Update lifecycle
 
@@ -1340,6 +1415,7 @@ services:
   agent:
     image: vlsi-agent:latest
     build: .
+    mem_limit: 2g
     ports:
       - "8000:8000"
     environment:
@@ -1360,6 +1436,9 @@ services:
       - KLAYOUT_URL=http://klayout:8000      # KLayout DRC HTTP trigger endpoint
       - EDA_HOST=virtuoso                    # or icc2, klayout
       - EDA_VERSION=icadvm_23_1
+      - EDA_SHARE_MIN_FREE_MB=100            # pre-flight disk check threshold (§15.1)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # required on Linux; harmless on macOS/Windows
     volumes:
       - eda_docs:/eda_docs:ro                # vendor doc mount (read-only)
       - eda_share:/eda_share                 # shared staging volume (delta + OASIS files)
@@ -1370,6 +1449,7 @@ services:
 
   chromadb:
     image: chromadb/chroma:latest
+    mem_limit: 4g
     ports:
       - "127.0.0.1:8001:8000"               # internal only — not exposed to LAN
     volumes:
@@ -1377,6 +1457,7 @@ services:
 
   eda_daemon:
     image: vlsi-agent:latest
+    mem_limit: 16g                           # 8 GB target for 1M nets; headroom for peak
     command: ["./eda_daemon", "--port", "8080", "--share-dir", "/eda_share"]
     ports:
       - "127.0.0.1:8080:8080"
@@ -1385,6 +1466,7 @@ services:
 
   constraints:
     image: vlsi-agent:latest
+    mem_limit: 512m
     command: ["python", "-m", "constraints_tool.mcp_server", "--port", "18081"]
     ports:
       - "127.0.0.1:18081:18081"
@@ -1392,6 +1474,7 @@ services:
   klayout:
     image: vlsi-klayout:latest               # separate image: KLayout + noVNC + Xvfb
     build: docker/klayout/
+    mem_limit: 4g
     ports:
       - "127.0.0.1:6080:6080"               # noVNC web viewer (browser-accessible)
       - "127.0.0.1:5900:5900"               # raw VNC (optional, for VNC clients)
@@ -1434,7 +1517,7 @@ volumes:
 | Agent → cloud LLM | Container → internet | Through host network (requires outbound HTTPS) |
 | Agent → Ollama | Container → container | `http://ollama:11434` (internal net, if enabled) |
 
-> **Linux note.** `host.docker.internal` is not available by default on Linux. Add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `agent` service, or set `HEA_URL` to the host's LAN IP.
+> **Linux note.** `host.docker.internal` requires `extra_hosts: ["host.docker.internal:host-gateway"]` on Linux — this is already set in the compose reference above. If the host has multiple NICs, you can override by setting `HEA_URL` to the host's LAN IP directly.
 
 > **Shared volume note.** The `eda_share` volume is bind-mounted to `/tmp/eda_share` on the host so the HEA EU can read the binary delta file from the host filesystem. On Linux this is automatic via the bind-mount. On macOS with Docker Desktop, the `/tmp/eda_share` host path needs to be in the Docker Desktop → Settings → Resources → File Sharing allowlist.
 
@@ -1776,3 +1859,226 @@ hiRunCalibrevsDRC(
     ?ruleFile (euStateGet "input.runset_path")
 )
 ```
+
+---
+
+## 15. Graceful Degradation and Failure Modes
+
+Every external dependency can fail. This section defines what happens when it does. The guiding principle: **degrade capability, never crash the session.**
+
+### 15.1 Failure mode matrix
+
+| Component down | Detection | Automatic fallback | User-visible impact | Manual recovery |
+|---|---|---|---|---|
+| **HEA unreachable** (no proprietary host running) | WS handshake timeout on `:18082` (2s) | Policy router downgrades `AUTO` → `EXTERNAL_ONLY` for all capabilities; `INTERNAL_ONLY` requests return an error with explanation | No in-host EU execution; external-only mode. Routing/placement still works via C++ daemon | Start the EDA host + load HEA loader |
+| **eda_daemon unreachable** | WS handshake timeout on `:8080` (2s) | Policy router downgrades `AUTO` → `INTERNAL_ONLY` for capabilities that have internal implementations; `EXTERNAL_ONLY` requests return an error | No custom C++ routing/placement; host-native tools only | `docker compose restart eda_daemon` |
+| **Both HEA and daemon down** | Both WS timeouts | `chat_node` still works (LLM answers questions); all tool-dispatch requests return an error: "No tool layer available" | Agent is a chatbot only — no EDA actions | Start at least one tool layer |
+| **ChromaDB unreachable** | HTTP health check on `:8001` fails | RAG service returns empty context; policy router falls back to a **static capability→tool mapping** (hardcoded table, no vector search); script synthesis proceeds without API doc context (higher hallucination risk) | Slightly degraded tool selection; LLM-synthesized EUs may use wrong API names | `docker compose restart chromadb` |
+| **KLayout DRC service unreachable** | HTTP health check on `:8000` (KLayout HTTP trigger) fails | DRC gate (Phase 3) is **skipped** with a warning in the job trace; five-phase protocol becomes three-phase: Compute → Pre-flight → Apply | No geometric sanity check before DB write — higher risk of committing bad shapes. Sign-off DRC (Calibre/Pegasus) is still triggered at end of flow | `docker compose restart klayout` |
+| **LLM provider unreachable** | API call timeout (30s) or HTTP error | `parse_intent` fails → agent cannot understand user requests. Script synthesis fails → EU compiler uses registry-only mode (no novel EUs) | Agent cannot parse new commands or synthesize novel EUs; existing registry templates still work | Check API key / Ollama status / network |
+| **`/eda_share` volume full or read-only** | Pre-flight disk check before Phase 1: `os.statvfs("/eda_share").f_bavail * block_size < 100MB` | Phase 1 (Compute) aborted before writing; error returned to user: "Shared volume has insufficient space" | Routing job cannot proceed | Clear old job files: `rm /eda_share/delta_*.bin /eda_share/routing_*.oas` |
+| **Constraints MCP unreachable** | HTTP timeout on `:18081` | Placer module falls back to local `spice_to_analog_problem.py` parser (less accurate, but functional) | Slightly degraded SPICE constraint extraction | `docker compose restart constraints` |
+| **Orphaned undo group** (agent crash between Phase 4 and Phase 5) | HEA watchdog timer: any undo group open > 60s without a `deploy_eu` in flight | HEA auto-closes the undo group with `hiUndoGroupEnd()` and logs a warning; no shapes were applied (Phase 5 never started), so closing the empty group is safe | User sees a "recovered from interrupted operation" message on next interaction | If shapes were partially applied, user can Ctrl+Z to undo the group |
+
+### 15.2 Static capability→tool fallback (when ChromaDB is down)
+
+When the RAG service is unavailable, the policy router uses a hardcoded mapping instead of vector search:
+
+```python
+STATIC_TOOL_MAP: dict[str, str] = {
+    "route_nets":   "routing_mcp_server",
+    "place_cells":  "placement_mcp_server",
+    "db.status":    "database_mcp_server",
+    "db.get_nets":  "database_mcp_server",
+    "db.get_bboxes":"database_mcp_server",
+    "view.zoom_to": "windows_mcp_server",
+    "view.refresh": "windows_mcp_server",
+}
+
+def resolve_tool(capability: str, rag_available: bool) -> str:
+    if rag_available:
+        return rag_service.query(capability).tool_recommendation
+    return STATIC_TOOL_MAP.get(capability, "chat_node")
+```
+
+### 15.3 Health check contract
+
+Every service in the compose stack exposes a health endpoint. The agent polls these at startup and periodically (every 30s) to maintain an availability map:
+
+| Service | Health endpoint | Healthy response |
+|---|---|---|
+| agent | `GET /health` | `{"status": "ok", ...}` |
+| chromadb | `GET /api/v1/heartbeat` | `{"nanosecond heartbeat": <int>}` |
+| eda_daemon | WS handshake on `:8080` + `{"method": "ping"}` | `{"result": "pong"}` |
+| constraints | `GET /health` | `{"status": "ok"}` |
+| klayout | `GET /health` | `{"status": "ok"}` (from `klayout_server.py`) |
+| HEA (on host) | WS handshake on `:18082` + `{"method": "ping"}` | `{"result": "pong"}` |
+
+The availability map is stored in Graph A's state as `available_services: dict[str, bool]` and is readable by every node. The policy router consults it before making layer decisions.
+
+### 15.4 Startup order and dependency gates
+
+```mermaid
+graph LR
+    CDB["chromadb"] --> A["agent"]
+    D["eda_daemon"] --> A
+    C["constraints"] --> A
+    KL["klayout"] --> A
+
+    A -. "optional at startup" .-> HEA["HEA (on host)"]
+
+    style A fill:#e67e22,color:#fff
+    style HEA fill:#8e44ad,color:#fff,stroke-dasharray: 5 5
+```
+
+- `chromadb`, `eda_daemon`, `klayout`, and `constraints` are `depends_on` targets in `docker-compose.yml` — the agent container waits for them.
+- The HEA is **not** a compose dependency — it lives on the host. The agent starts in `EXTERNAL_ONLY`-capable mode and upgrades to `AUTO` when the HEA connects.
+- If `chromadb` fails its health check after 3 retries, the agent starts anyway in RAG-degraded mode and logs a warning.
+
+---
+
+## 16. Structured Job Tracing
+
+Every phase boundary in the five-phase write protocol and every LangGraph node transition emits a structured trace event. This creates a complete audit trail for debugging production failures.
+
+### 16.1 Trace event schema
+
+```json
+{
+  "trace_id":    "job_2024_0418_001",
+  "phase":       "drc_gate",
+  "node":        "policy_router",
+  "timestamp_ms": 1713450123456,
+  "duration_ms":  4200,
+  "status":      "pass",
+  "inputs": {
+    "job_id": "route_001",
+    "oasis_path": "/eda_share/routing_001.oas",
+    "drc_script_path": "/eda_share/drc_001.rb"
+  },
+  "outputs": {
+    "violation_count": 0,
+    "critical_count": 0,
+    "rdb_path": "/eda_share/violations_001.rdb"
+  },
+  "error": null
+}
+```
+
+### 16.2 Trace points
+
+| Phase / node | Trace event emitted | Key fields |
+|---|---|---|
+| `parse_intent` | `intent_parsed` | `capability`, `layer_pref`, `llm_model`, `llm_latency_ms` |
+| `policy_router` | `layer_selected` | `capability`, `layer_pref`, `resolved_layer`, `rag_available`, `rag_latency_ms` |
+| Phase 1 — Compute | `compute_started`, `compute_completed` | `job_id`, `net_count`, `shape_count`, `wire_length_um`, `compute_time_s` |
+| Phase 2 — Extract rules | `rules_extracted` | `rule_count`, `source` (cached / fresh EU), `hea_latency_ms` |
+| Phase 3 — DRC gate | `drc_started`, `drc_completed` | `oasis_path`, `script_path`, `violation_count`, `critical_count`, `klayout_time_s` |
+| DRC reroute loop | `drc_reroute` | `attempt`, `offending_nets`, `reroute_time_s` |
+| Phase 4 — Pre-flight | `preflight_completed` | `eu_source` (registry / llm_generated), `eu_language`, `validation_ok` |
+| Script Synthesis | `synthesis_started`, `synthesis_completed` | `capability`, `host`, `rag_chunks_used`, `llm_model`, `repair_attempts`, `repl_ok` |
+| Phase 5 — Apply | `apply_started`, `apply_completed` | `shapes_applied`, `wall_time_s`, `undo_group_id` |
+| `collect_outputs` | `job_completed` | `total_time_s`, `layer_used`, `viewer_commands_count` |
+| Any failure | `job_failed` | `phase`, `error_type`, `error_detail`, `fallback_action` |
+
+### 16.3 Implementation
+
+The trace is implemented as a Python decorator applied to every LangGraph node:
+
+```python
+import time, json, logging
+
+trace_logger = logging.getLogger("vlsi.trace")
+trace_logger.setLevel(logging.INFO)
+
+def traced(phase: str):
+    """Decorator that emits structured trace events around a LangGraph node."""
+    def decorator(fn):
+        def wrapper(state: dict) -> dict:
+            trace_id = state.get("trace_id", "unknown")
+            event = {
+                "trace_id": trace_id,
+                "phase": phase,
+                "node": fn.__name__,
+                "timestamp_ms": int(time.time() * 1000),
+            }
+            try:
+                result = fn(state)
+                event["status"] = "ok"
+                event["duration_ms"] = int(time.time() * 1000) - event["timestamp_ms"]
+                event["outputs"] = _extract_trace_fields(result)
+                trace_logger.info(json.dumps(event))
+                return result
+            except Exception as e:
+                event["status"] = "error"
+                event["duration_ms"] = int(time.time() * 1000) - event["timestamp_ms"]
+                event["error"] = str(e)
+                trace_logger.error(json.dumps(event))
+                raise
+        return wrapper
+    return decorator
+```
+
+Usage on a node:
+
+```python
+@traced("drc_gate")
+def run_drc_gate(state: dict) -> dict:
+    ...
+```
+
+Traces are written to `stdout` (captured by Docker logging) and optionally to a rotating file at `/eda_share/traces/{trace_id}.jsonl`. Each line is one event — `grep` and `jq` friendly.
+
+### 16.4 Trace inspection
+
+```bash
+# View all events for a specific job
+docker logs agent 2>&1 | jq -r 'select(.trace_id == "job_2024_0418_001")'
+
+# Find failed phases
+docker logs agent 2>&1 | jq -r 'select(.status == "error")'
+
+# Latency breakdown for the last job
+docker logs agent 2>&1 | jq -r 'select(.trace_id == "job_2024_0418_001") | "\(.phase): \(.duration_ms)ms"'
+```
+
+---
+
+## 17. Latency Budget
+
+Target latencies for each phase. These are the numbers the implementation should be measured against.
+
+| Phase | Target latency | Bottleneck | Notes |
+|---|---|---|---|
+| `parse_intent` (LLM) | < 1 s | LLM inference | Cloud ~300ms; Ollama 70B ~800ms |
+| RAG tool selection | < 200 ms | ChromaDB vector search | **Cache hit: 0 ms.** Cache by `(capability, host, version)` per session |
+| Phase 1 — Compute (router) | 1–30 min (1M nets) | C++ router algorithm | This is the real work — latency depends on design size and algorithm convergence |
+| Phase 1 — Compute (placer) | 10 s – 5 min | Analytical placer + SA refinement | Analog placer is smaller but iterative |
+| Phase 2 — Extract rules | < 2 s (first call); **0 ms cached** | HEA EU round-trip | Cached in `state.tech_rules` for the session after first extraction |
+| Phase 3 — DRC gate | 5–60 s | KLayout headless + rule count × shape count | ~1s for 10K shapes; ~30s for 500K shapes; scales linearly |
+| Phase 4 — Pre-flight | < 500 ms | Jinja2 render + `validate_eu` | Registry path is <50ms; script synthesis path adds 5–30s (LLM) |
+| Script Synthesis (if needed) | 5–30 s | LLM generation + up to 2 repair loops | Budget: 10s per attempt × 3 attempts max = 30s worst case |
+| Phase 5 — Apply | 1–10 s (1M shapes) | HEA tight loop: sequential `dbCreatePath` / `layout.insert` | ~200 MB/s binary read + ~100K shapes/s write rate in Virtuoso SKILL |
+| End-to-end (small design, 10K nets) | < 2 min | Phase 1 dominates | Phases 2–5 are <15s combined |
+| End-to-end (large design, 1M nets) | < 35 min | Phase 1 dominates | Phases 2–5 are <90s combined |
+
+### Memory budget (system-level)
+
+| Service | Expected RSS | `mem_limit` in compose | Notes |
+|---|---|---|---|
+| `agent` (Python + LangGraph) | 200–500 MB | `2g` | Spikes during large RAG retrieval or DRC violation parsing |
+| `chromadb` | 500 MB – 2 GB | `4g` | Scales with total embedding count; ~1 GB for 5 collections × 50K chunks each |
+| `eda_daemon` (C++ router) | 2–8 GB | `16g` | Dominated by `RoutingGridGraph` + `SharedDatabase`; 8 GB is the G7 target for 1M nets |
+| `constraints` (Python MCP) | 50–100 MB | `512m` | Lightweight SPICE parser |
+| `klayout` (DRC + viewer) | 200 MB – 1 GB | `4g` | Spikes during DRC on large OASIS files |
+| **Total minimum host RAM** | | **24 GB** | 32 GB recommended for 1M-net designs |
+
+### `/eda_share` volume sizing
+
+| Design size | Binary delta | OASIS | DRC scripts + reports | Total per job | Recommended volume |
+|---|---|---|---|---|---|
+| 10K nets (~50K shapes) | ~1 MB | ~2 MB | ~100 KB | ~3 MB | 1 GB (holds ~300 jobs) |
+| 100K nets (~500K shapes) | ~10 MB | ~20 MB | ~200 KB | ~30 MB | 5 GB |
+| 1M nets (~5M shapes) | ~100 MB | ~200 MB | ~500 KB | ~300 MB | 10 GB |
+
+The agent deletes delta + OASIS files after a successful Phase 5 apply. Stale files from crashed jobs are cleaned by a periodic `find /eda_share -name "delta_*.bin" -mmin +60 -delete` cron inside the agent container.

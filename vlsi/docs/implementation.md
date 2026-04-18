@@ -52,6 +52,8 @@ The OASIS writer (`eda_router/src/oasis_writer.cpp`) and binary delta writer (`e
 14. [Implementation Roadmap](#14-implementation-roadmap)
 15. [Verification Plan](#15-verification-plan)
 
+> **Maturity note.** This document describes the **target architecture** for the C++ layer. The current codebase contains the `eda_router` static library (with 6 passing CTest suites), the `eda_placer` static library (1 CTest), and the `eda_daemon` gateway (builds and links). The 13-library namespace split, OASIS writer, binary delta writer, via expander, and pybind11 modules are **designed but not yet implemented** — their headers are organized for the target split, but the CMake build compiles everything into one static lib today. See the [Maturity Matrix in architecture.md](./architecture.md#maturity-matrix) for the full status breakdown.
+
 ---
 
 ## 2. Overview and Goals
@@ -984,6 +986,36 @@ Optional dependencies detected at configure time:
 | Target | Type | Contents |
 |---|---|---|
 | `eda_placer` | Static lib | `src/analog_placer.cpp`, `src/analytical_placer.cpp` |
+
+### Enforcing the 13-library dependency DAG at build time
+
+The 13-namespace factoring described in §4 is currently enforced only by header directory convention — the single `routing_genetic_astar_io` static lib does not prevent, say, `routing/` code from including `eco/` headers. To enforce the intended dependency DAG without splitting into separate `.a` files, add `INTERFACE` libraries with restricted include paths:
+
+```cmake
+# eda_router/CMakeLists.txt — dependency enforcement (add alongside existing targets)
+
+# One INTERFACE target per logical module — no compiled sources, just include path restrictions
+foreach(mod core analysis threading planner routing constraints convergence eco evaluation)
+    add_library(rga_${mod} INTERFACE)
+    target_include_directories(rga_${mod} INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/routing_genetic_astar/${mod}>
+    )
+endforeach()
+
+# Encode the dependency DAG — each module may only include headers from its declared deps
+target_link_libraries(rga_analysis  INTERFACE rga_core)
+target_link_libraries(rga_threading INTERFACE rga_core)
+target_link_libraries(rga_planner   INTERFACE rga_core rga_analysis)
+target_link_libraries(rga_routing   INTERFACE rga_core rga_analysis rga_planner rga_threading)
+target_link_libraries(rga_constraints INTERFACE rga_core rga_analysis rga_routing)
+target_link_libraries(rga_convergence INTERFACE rga_core rga_routing rga_threading)
+target_link_libraries(rga_eco       INTERFACE rga_core rga_routing rga_threading)
+target_link_libraries(rga_evaluation INTERFACE rga_core rga_routing rga_constraints)
+```
+
+With this in place, if a source file in `routing/` adds `#include <routing_genetic_astar/eco/eco_router.hpp>`, the build fails because `rga_routing` does not list `rga_eco` as a dependency. This catches accidental coupling at configure time — no runtime cost, no separate archives.
+
+The test executables and the `vlsi_daemon` / `eda_daemon` targets link the full `routing_genetic_astar_io` lib as before (they are top-level consumers that need everything). The `INTERFACE` targets are purely for compile-time enforcement during development.
 
 ### Planned additional targets
 
