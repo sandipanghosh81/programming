@@ -1051,7 +1051,11 @@ vlsi/agent/
         w2_drc_fix_loop.py             Iterative DRC correction (EU-preferred)
       eu_registry/                     Jinja2 templates per host
         cadence_virtuoso/
+          extract_tech_rules.skill.j2  Layer minWidth/minSpacing/minArea/minEnclosure → JSON
+          extract_via_tech.skill.j2    Via definitions (cut/enclosure/stacking rules) → JSON
         synopsys_icc2/
+          extract_tech_rules.tcl.j2
+          extract_via_tech.tcl.j2
         klayout/
         manifest.json
       utils/
@@ -1079,6 +1083,8 @@ vlsi/eda_tools/
   eda_cli/                             C++ CLI + MCP gateway (daemon)
     oasis_writer.cpp / .h              Streaming OASIS encoder (no external dep)
   routing_genetic_astar/               router library
+    via_expander.cpp / .h              Stage 2: via type selection, array sizing, 3-layer geometry
+    binary_delta_writer.cpp / .h       Flat binary delta writer (20 B/shape)
   eda_placer/                          placer library (WIP)
   python/constraints_tool/             Python constraints MCP server
 

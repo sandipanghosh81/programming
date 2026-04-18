@@ -48,8 +48,9 @@ The OASIS writer is implemented in `vlsi/eda_tools/eda_cli/oasis_writer.cpp` usi
 10. [Python Bindings](#10-python-bindings)
 11. [Transport / WebSocket](#11-transport--websocket)
 12. [Build System](#12-build-system)
-13. [Implementation Roadmap](#13-implementation-roadmap)
-14. [Verification Plan](#14-verification-plan)
+13. [Via Rule Handling and Via Generation](#13-via-rule-handling-and-via-generation)
+14. [Implementation Roadmap](#14-implementation-roadmap)
+15. [Verification Plan](#15-verification-plan)
 
 ---
 
@@ -1002,7 +1003,215 @@ endif
 
 ---
 
-## 13. Implementation Roadmap
+## 13. Via Rule Handling and Via Generation
+
+Via rules are structurally different from metal spacing rules. A via involves **three layers simultaneously** (lower metal, cut layer, upper metal) with asymmetric enclosure requirements, array sizing constraints, and stacking rules that depend on which layer pairs are adjacent. The router cannot handle this inline during topology planning — it uses a clean two-stage split.
+
+### 13.1 Two-stage architecture
+
+**Stage 1 — Topology planner (`routing_genetic_astar`):**
+Plans wire centerlines and layer transitions on a routing grid. At each layer-change point it records a *via placeholder* with a via-type tag and the selected track coordinates. The planner only needs the via *footprint* (bounding box of the full assembled via structure on each layer) to verify that sufficient space exists. It does not generate cut geometry.
+
+**Stage 2 — Via expander (`via_expander.cpp`):**
+After routing is complete, walks every via placeholder in net order, selects the via type and array dimensions, generates the three-layer geometry (lower-metal landing pad, cut shapes, upper-metal landing pad), performs a local conflict check, and emits all shapes into the binary delta and OASIS writer.
+
+```
+route_nets() call
+    ┣━ Stage 1 — A* topology planner
+    │     inputs:  netlist, routing grid, via_tech JSON, layer graph
+    │     outputs: RouteTopology {wire_segments[], via_placeholders[]}
+    ┗━ Stage 2 — ViaExpander::expand(topology, via_tech)
+          ┣━ select via type + compute array dimensions
+          ┣━ generate 3-layer geometry per placeholder
+          ┣━ conflict check vs. already-emitted shapes
+          ┗━ emit to OASISWriter + BinaryDeltaWriter
+```
+
+### 13.2 Via technology data — extraction and format
+
+Via definitions are extracted from the live EDA techfile once per design session by the `extract_via_tech` HEA EU (registry: `eu_registry/{host}/extract_via_tech.{skill,tcl}.j2`) and passed to the daemon at job start as a JSON payload.
+
+```json
+{
+  "via_rules": [
+    {
+      "name":           "via1_std",
+      "lower_layer":    "metal1",  "lower_gds_layer": 31,
+      "cut_layer":      "via1",    "cut_gds_layer":   51,
+      "upper_layer":    "metal2",  "upper_gds_layer": 32,
+      "cut_w_nm":       50,        "cut_h_nm":        50,
+      "enc_lower_x_nm": 35,        "enc_lower_y_nm":  50,
+      "enc_upper_x_nm": 35,        "enc_upper_y_nm":  50,
+      "cut_spacing_x_nm": 70,      "cut_spacing_y_nm": 70,
+      "max_array_cols": 4,         "max_array_rows":  4,
+      "min_array_cols": 1,         "min_array_rows":  1,
+      "stackable":      true,
+      "stagger_x_nm":   0,         "stagger_y_nm":    0
+    }
+  ]
+}
+```
+
+All dimensions are in nm (integer database units). The `min_array_*` fields encode mandatory multi-cut requirements (e.g., power nets on some layers require ≥ 2×2 arrays).
+
+### 13.3 Via footprint computation (Stage 1 — planner)
+
+The planner computes the via footprint for each layer-pair as a static pre-pass before routing begins:
+
+```cpp
+struct ViaFootprint {
+    int32_t lower_w, lower_h;   // full metal shape size on lower layer (nm)
+    int32_t upper_w, upper_h;   // full metal shape size on upper layer (nm)
+    int32_t grid_cost;          // routing grid cells consumed in each direction
+};
+
+ViaFootprint compute_footprint(const ViaRule& r, int min_array_cols, int min_array_rows) {
+    int32_t array_w = (min_array_cols - 1) * (r.cut_w + r.cut_spacing_x) + r.cut_w;
+    int32_t array_h = (min_array_rows - 1) * (r.cut_h + r.cut_spacing_y) + r.cut_h;
+    return {
+        .lower_w = array_w + 2 * r.enc_lower_x,
+        .lower_h = array_h + 2 * r.enc_lower_y,
+        .upper_w = array_w + 2 * r.enc_upper_x,
+        .upper_h = array_h + 2 * r.enc_upper_y,
+    };
+}
+```
+
+A routing grid point is only a valid via candidate if both `lower_w × lower_h` AND `upper_w × upper_h` fit within the available wire space at that location on their respective layers.
+
+### 13.4 Via type selection (Stage 2 — expander)
+
+```cpp
+ViaSelection ViaExpander::select_via(const ViaPlaceholder& ph,
+                                     const RouteContext& ctx) const {
+    const ViaRule& rule = via_tech_.find(ph.lower_layer, ph.upper_layer);
+
+    // 1. Compute available space on both layers at the via location
+    int32_t avail_x = ctx.wire_width_at(ph.center, ph.lower_layer);
+    int32_t avail_y = ctx.wire_length_at(ph.center, ph.lower_layer);
+
+    // 2. Determine array dimensions that fit
+    //    n_cols: how many cut columns fit given available width and minimum enclosure
+    int32_t n_cols = std::clamp(
+        (avail_x - 2 * std::max(rule.enc_lower_x, rule.enc_upper_x) + rule.cut_spacing_x)
+            / (rule.cut_w + rule.cut_spacing_x),
+        rule.min_array_cols, rule.max_array_cols);
+    int32_t n_rows = std::clamp(
+        (avail_y - 2 * std::max(rule.enc_lower_y, rule.enc_upper_y) + rule.cut_spacing_y)
+            / (rule.cut_h + rule.cut_spacing_y),
+        rule.min_array_rows, rule.max_array_rows);
+
+    // 3. If min_array_cols not achievable → rotate via 90°
+    if (n_cols < rule.min_array_cols || n_rows < rule.min_array_rows) {
+        // try swapping X/Y enclosure (via rotation)
+        auto rotated = try_rotated(rule, avail_x, avail_y);
+        if (!rotated.ok) {
+            return ViaSelection{.ok = false};  // router must avoid this location
+        }
+        return rotated;
+    }
+    return ViaSelection{.ok = true, .n_cols = n_cols, .n_rows = n_rows, .rule = &rule};
+}
+```
+
+### 13.5 Via shape generation (Stage 2 — expander)
+
+Once the array dimensions are selected, the expander generates the three-layer shape set:
+
+```cpp
+void ViaExpander::emit_via(const ViaSelection& sel,
+                           const ViaPlaceholder& ph,
+                           OASISWriter& oas,
+                           BinaryDeltaWriter& delta) const {
+    const ViaRule& r = *sel.rule;
+    int32_t cx = ph.center.x,  cy = ph.center.y;
+
+    // Total array extent
+    int32_t arr_w = (sel.n_cols - 1) * (r.cut_w + r.cut_spacing_x) + r.cut_w;
+    int32_t arr_h = (sel.n_rows - 1) * (r.cut_h + r.cut_spacing_y) + r.cut_h;
+
+    // Lower metal landing pad (centered on cx, cy)
+    int32_t lx = arr_w + 2 * r.enc_lower_x,  ly = arr_h + 2 * r.enc_lower_y;
+    oas.write_rect(r.lower_gds_layer, 0, cx - lx/2, cy - ly/2, lx, ly, ph.net);
+    delta.write_rect(r.lower_gds_layer, ph.net_idx, cx - lx/2, cy - ly/2, lx, ly);
+
+    // Cut shapes — one rect per cell in the array
+    int32_t origin_x = cx - arr_w/2,  origin_y = cy - arr_h/2;
+    for (int col = 0; col < sel.n_cols; ++col) {
+        for (int row = 0; row < sel.n_rows; ++row) {
+            int32_t kx = origin_x + col * (r.cut_w + r.cut_spacing_x);
+            int32_t ky = origin_y + row * (r.cut_h + r.cut_spacing_y);
+            oas.write_rect(r.cut_gds_layer, 0, kx, ky, r.cut_w, r.cut_h, ph.net);
+            delta.write_rect(r.cut_gds_layer, ph.net_idx, kx, ky, r.cut_w, r.cut_h);
+        }
+    }
+
+    // Upper metal landing pad
+    int32_t ux = arr_w + 2 * r.enc_upper_x,  uy = arr_h + 2 * r.enc_upper_y;
+    oas.write_rect(r.upper_gds_layer, 0, cx - ux/2, cy - uy/2, ux, uy, ph.net);
+    delta.write_rect(r.upper_gds_layer, ph.net_idx, cx - ux/2, cy - uy/2, ux, uy);
+}
+```
+
+### 13.6 Via stacking (multi-layer connections)
+
+When a net transitions more than one layer (e.g., M1 → M3), the expander walks the via stack from the lowest layer upward. For each adjacent pair:
+
+- **Stackable pair** (`stackable = true`, `stagger = 0`): both via arrays share the same center XY — the upper via cuts land directly above the lower cuts.
+- **Non-stackable pair** (`stackable = false`): the upper via center is offset by `{stagger_x, stagger_y}` from the lower via center. The router's topology stage must have reserved space for this offset on the intermediate metal.
+
+```cpp
+void ViaExpander::expand_stack(const std::vector<ViaPlaceholder>& stack, ...) {
+    Point2D center = stack[0].center;
+    for (const auto& ph : stack) {
+        emit_via(select_via(ph, ctx), {ph.layer_pair, center}, ...);
+        // shift center for next via if stagger required
+        const ViaRule& r = via_tech_.find(ph.lower_layer, ph.upper_layer);
+        if (!r.stackable) {
+            center.x += r.stagger_x;
+            center.y += r.stagger_y;
+        }
+    }
+}
+```
+
+### 13.7 Conflict checking and repair budget
+
+After via geometry is generated, the expander does a fast spatial query using a per-layer interval tree (already populated with all emitted wire shapes) to detect:
+
+- Via cut to adjacent via cut spacing violation (same or adjacent layer)
+- Via lower/upper landing pad encroaching on a neighboring net's wire
+
+Detected conflicts are sorted by severity and pushed back to the router as a list of *blocked via locations* for a repair pass. The repair budget is the same `repair_budget` counter used by the EU Compiler's script synthesis repair loop — typically 2–3 rounds.
+
+```cpp
+struct ViaConflict {
+    ViaPlaceholder src;
+    ConflictKind   kind;   // CUT_TO_CUT | PAD_TO_WIRE
+    NetId          offender;
+};
+
+std::vector<ViaConflict> ViaExpander::check_conflicts(
+    const ViaSelection& sel,
+    const ViaPlaceholder& ph,
+    const IntervalTree<Shape>& placed) const;
+```
+
+### 13.8 What this does NOT handle (advanced-node limits)
+
+The via expander handles the geometry and array sizing correctly for any via rule that can be expressed as scalar enclosure, cut spacing, and stagger values. At advanced nodes, additional rules exist that require information beyond the via tech JSON:
+
+| Rule type | Why it cannot be handled here | Path forward |
+|---|---|---|
+| **Via-dependent metal widening** | Some foundries require the metal to widen around a via array (jog-free connection rule) — the wire shape depends on the via, not just the net width | Router must pre-widen wires at layer transitions; not yet implemented |
+| **Cut-class rules** | Some via layers have multiple cut classes (wide, narrow) with different spacing tables | Extend `via_tech` JSON with `cut_class` field; select class based on adjacent feature size |
+| **Via keep-out near cell boundaries** | Placement-blockage-aware via forbidden zones near standard cell power rails | Feed cell blockage map to expander |
+| **Redundant-via insertion (reliability)** | After initial via placement, a separate pass upgrades single vias to the maximum achievable array for reliability | Separate post-route pass: `redundant_via_inserter.cpp` (planned) |
+| **EUV stitching rules (3nm+)** | Via coverage rules for EUV single-exposure stitching seams — not representable as simple enclosure data | Requires foundry SVRF runset interpretation; out of scope for open-source engine |
+
+---
+
+## 14. Implementation Roadmap
 
 Build libraries in dependency order. Each step unlocks a capability — ship incrementally.
 
@@ -1027,7 +1236,7 @@ Build libraries in dependency order. Each step unlocks a capability — ship inc
 
 ---
 
-## 14. Verification Plan
+## 15. Verification Plan
 
 ### Unit Tests — Catch2 (one `.cpp` per class)
 
