@@ -1468,7 +1468,54 @@ curl http://localhost:8000/health
 
 This section covers how the agent implements DRC using open-source tooling (no proprietary DRC engine licence required) and how writes are committed to the live EDA database via the five-phase protocol.
 
-### 14.1 The DRC problem and why OA techfile data is enough
+### 14.1 Scope and node-dependency of KLayout DRC
+
+> **Critical limitation:** The KLayout DRC approach described here is a **router sanity checker**, not a sign-off DRC engine. Its effectiveness degrades sharply at advanced nodes. Engineers and implementers must understand these limits before relying on it.
+
+#### How rules are stored — the data vs. program gap
+
+At legacy nodes (28nm and above), design rules are stored in the techfile as **structured scalar data** — `techGetLayerParamValue` returns a single number per rule. At advanced nodes the rule model breaks:
+
+| Node | Rule model | `techGetLayerParamValue` returns | Reality |
+|---|---|---|---|
+| 28nm and above | Scalar data (`minWidth = 0.064um`) | The correct value | Accurate |
+| 7nm–5nm | **Parametric tables** (spacing depends on width AND run-length simultaneously) | Scalar floor only — misses conditional violations | Partial / optimistic |
+| 3nm–2nm | **Executable runsets** (Calibre SVRF, tens of thousands of lines of procedural rule code) | Scalar floor of the simplest rule only | Misleading — most rules not represented |
+
+#### What the KLayout DRC path CAN check (any node)
+
+These checks are purely geometric and remain valid regardless of process node:
+
+| Check | Why it is always valid |
+|---|---|
+| **Short circuits** (diff-net polygon overlap on same layer) | Pure intersection test — no technology data needed |
+| **Gross width violations** (wire significantly below scalar minimum) | Catches router algorithmic errors, not marginal violations |
+| **Obvious via mis-alignment** (via completely outside enclosing metal) | Geometric enclosure test |
+| **Off-grid shapes** (coordinates not aligned to manufacturing grid) | Grid value from techfile; valid at any node |
+
+#### What breaks at advanced nodes
+
+| Feature | Why it fails with OA techfile scalars |
+|---|---|
+| **End-of-line (EOL) spacing** | Rule is a 2D table: spacing depends on line-end length AND adjacent metal width — `techGetLayerParamValue` returns only the scalar floor |
+| **Parallel run-length (PRL) spacing** | Spacing between two wires depends on how long they run alongside each other — another 2D table; scalar minimum misses real violations |
+| **Jog rules** | Short metal jogs have different spacing than long straight runs — parametric, not scalar |
+| **Multi-patterning (SADP/SAQP/EUV)** | Every metal layer at 7nm and below requires coloring/decomposition; the DRC check itself is a graph-coloring validity test — not a geometric width/spacing check |
+| **GAAFET topology rules (3nm/2nm)** | Gate cut placement, nanosheet alignment, backside PDN keep-out zones — topological rules about device structure, not polygon geometry |
+| **Connectivity-aware rules** | At 2nm almost all rules have connectivity components: same-net vs diff-net, power-rail minimum widths, redundant-via requirements |
+| **Foundry runset complexity** | The Calibre SVRF file for a 2nm node is tens of thousands of lines of conditional procedural code. This is not encoded in `techGetLayerParamValue` at all — it is only available in the proprietary runset |
+| **CMP density** | Window-based density check over sliding windows; the full rule is not stored as a scalar |
+
+#### Node-suitability summary
+
+| Node | KLayout DRC utility | Risk of false confidence |
+|---|---|---|
+| 28nm and above | High — catches most common routing violations | Low |
+| 16nm / 12nm | Medium — catches gross violations; misses EOL/PRL subtleties | Medium |
+| 7nm / 5nm | Low — only gross shorts and width violations are reliable | High — parametric rules not checked |
+| 3nm / 2nm | Sanity check only — shorts + grid + obvious width | Very high — do not treat as a DRC pass |
+
+**The correct use at any advanced node:** the KLayout DRC gate is a **fast inner-loop filter** that catches algorithmic bugs in the C++ router (shorts, obviously malformed shapes) before those bugs enter the live EDA database. It is not a substitute for running the foundry-provided Calibre/Pegasus sign-off runset. The agent always triggers the proprietary sign-off DRC at the end of the P&R flow via a HEA EU — see §14.8.
 
 EDA tools store design rules as structured data in the technology file, accessible via scripting APIs:
 
@@ -1477,25 +1524,6 @@ EDA tools store design rules as structured data in the technology file, accessib
 | Cadence Virtuoso (SKILL) | `techGetLayerParamValue` | `techGetLayerParamValue(techfile "metal1" "minWidth")` → `0.06` |
 | Synopsys ICC2 (Tcl) | `tech::get_rule` | `tech::get_rule -layer metal1 -rule min_width` → `0.064` |
 | KLayout (Python) | `tech.layer_info` / `DRCEngine` | `RBA::Technology.technology_by_name("sky130").drc_script` |
-
-The agent extracts these rules once (via a one-shot HEA EU) and stores them as a JSON rules dictionary. KLayout's built-in DRC engine — which is open-source, ships with KLayout, and runs headlessly — can then check routing results against these rules **without any proprietary DRC licence**. The checks it can run:
-
-| Check type | Covered | Notes |
-|---|---|---|
-| Minimum width (per metal layer) | Yes | Direct techfile parameter |
-| Minimum spacing (same layer, diff net) | Yes | Direct techfile parameter |
-| Minimum spacing (same layer, same net) | Yes | Optional; some PDKs define this |
-| Enclosure (via inside metal) | Yes | Per via-metal layer pair |
-| Extension (metal beyond via edge) | Yes | Per via-metal layer pair |
-| Minimum area | Yes | Direct techfile parameter |
-| Off-grid shapes | Yes | Grid derived from manufacture grid in techfile |
-| Short circuit (overlap of diff-net shapes) | Yes | Geometric intersection check |
-| **Antenna rules** | No — requires net topology | Complex; needs LVS-level extraction |
-| **CMP density** | Partial — simple window | Full CMP rules need proprietary engine |
-| **Multi-patterning** | No | Requires proprietary coloring engine |
-| **Electrical rules (ERC)** | No — requires SPICE | Out of scope for geometric DRC |
-
-For the agent's routing feedback loop, the geometric checks above catch the vast majority of DRC violations produced by the C++ router — width, spacing, enclosure, and shorts are the dominant failure modes.
 
 ### 14.2 Techfile rule extraction (one-shot HEA EU)
 
@@ -1703,13 +1731,24 @@ curl -X POST http://localhost:8088/open \
 
 ### 14.8 What this does NOT replace
 
-The KLayout DRC path handles geometric checks on the routing delta. It does not replace:
+The KLayout DRC path handles basic geometric checks on the routing delta. It does not replace:
 
-| Proprietary capability | Why it still needs the host tool |
-|---|---|
-| Full-chip signoff DRC (Calibre, Pegasus) | Handles complex multi-patterning, CMP density, parametric rules, antenna — required for tape-out |
-| LVS (Layout vs. Schematic) | Requires full netlist extraction tied to schematic; KLayout can do LVS too but needs accurate schematic CDL |
-| PEX (Parasitic extraction) | Requires field-solver or table-based extractor with foundry sign-off |
-| Timing closure / STA | Requires PEX + liberty models |
+| Proprietary capability | Why it still needs the host tool | Advanced node note |
+|---|---|---|
+| **Signoff DRC (Calibre, Pegasus)** | Parametric/table-based rules, multi-patterning, CMP density, antenna — required for tape-out | At 5nm and below this is the *only* reliable DRC — KLayout misses the majority of real rules |
+| **LVS (Layout vs. Schematic)** | Requires full netlist extraction tied to schematic; KLayout can do LVS but needs accurate CDL | Node-independent in principle; foundry LVS runsets are complex |
+| **PEX (Parasitic extraction)** | Requires field-solver or table-based extractor with foundry sign-off | RC models change radically node-to-node; no open-source tool covers advanced node PDKs |
+| **Timing closure / STA** | Requires PEX + liberty models | Node-independent architecture; depends on PEX accuracy |
+| **Multi-patterning decomposition (7nm+)** | Graph-coloring + SVRF rule code; KLayout coloring is basic | Mandatory for all metal layers at 7nm and below |
+| **GAAFET / nanosheet rules (3nm/2nm)** | Topological device rules; not representable as geometry checks | No open-source engine handles this today |
 
-The agent's KLayout DRC is the **fast inner-loop check** in the DRC fix loop (`w2_drc_fix_loop`). Calibre/Pegasus sign-off DRC is run by the engineer at the end of the P&R flow using the host's native DRC launcher — that call can also be triggered via a HEA EU when the agent decides the design is ready for formal sign-off.
+**Triggering sign-off DRC via the agent:** after the agent decides the routing is ready (KLayout sanity check passes + manual inspection), a HEA EU can trigger the host's native DRC launcher (e.g., `hiRunCalibrevsDRC` in Virtuoso or `verify_drc` in ICC2). This is still running the proprietary engine on the proprietary host — the agent merely initiates it and monitors the results.
+
+```
+; Example HEA EU — trigger Calibre DRC from Virtuoso
+hiRunCalibrevsDRC(
+    ?cellName (euStateGet "input.cell_name")
+    ?runDir "/tmp/calibre_drc"
+    ?ruleFile (euStateGet "input.runset_path")
+)
+```
