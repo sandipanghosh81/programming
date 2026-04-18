@@ -16,21 +16,21 @@ This C++ layer is the **external tool layer** of the VLSI agent (see [`architect
 
 This layer is one of two tool layers in the agent:
 
-- **External tool layer (this document)** — custom C++ algorithms in the standalone `eda_daemon` process. Reached via JSON-RPC. Home of `routing_genetic_astar`, `eda_placer`, DB reader, window automation.
+- **External tool layer (this document)** — custom C++ algorithms in the standalone `eda_daemon` process. Reached via JSON-RPC. The router algorithm (`routing_genetic_astar` namespace) lives in the `eda_router` project and is linked into `eda_daemon` via the `eda_router_io` static library. The placer lives in `eda_placer`.
 - **Internal tool layer (not this document)** — host-embedded Host Execution Agent (HEA) running inside a proprietary EDA tool (Cadence Virtuoso, Synopsys ICC2, KLayout). Reached via MCP tools (`deploy_eu`, `query_state`, `write_state`, `stream_log`). Implemented in host-native scripting (SKILL, Tcl, or in-process Python). Documented in [`architecture.md`](./architecture.md) §10.
 
 The two layers cooperate under the orchestrator's routing policy (`AUTO` / `INTERNAL_ONLY` / `EXTERNAL_ONLY` / `BOTH`). For many capabilities — notably `route_nets` and `place_cells` — peer implementations exist in both layers, and the orchestrator may run one, the other, or both for cross-validation. Nothing in this C++ codebase depends on the HEA or on any proprietary host; the daemon is fully standalone and supports `EXTERNAL_ONLY` workflows as well as the external branch of `AUTO` / `BOTH` workflows.
 
 > **What this document does not cover:** the HEA implementations (SKILL / Tcl / PyQt) that live inside proprietary hosts, the EU registry (Jinja2 templates), the EU compiler node, or the policy router — all of those belong to the Python agent layer and are covered in `architecture.md` §10 and the companion `hea/` source tree.
 
-**Dual-output model (as of current architecture):** For every routing / placement job, the daemon now produces two outputs written to the shared bind-mount volume (`/eda_share/`):
+**Dual-output model (planned — not yet in codebase):** For every routing / placement job, the daemon will produce two outputs written to the shared bind-mount volume (`/eda_share/`):
 
 | Output file | Format | Consumer | Purpose |
 |---|---|---|---|
 | `delta_{job_id}.bin` | Custom flat binary (see `architecture.md §14.6`) | HEA EU (Phase 5 apply loop) | Fast bulk write into the live EDA DB — ~20 B/shape, read by a short SKILL/Tcl parser |
 | `routing_{job_id}.oas` | OASIS (open standard) | KLayout DRC service + noVNC debug viewer | Geometric DRC check and visual inspection before the live DB is touched |
 
-The OASIS writer is implemented in `vlsi/eda_tools/eda_cli/oasis_writer.cpp` using a minimal streaming OASIS encoder (no library dependency — OASIS is a well-documented binary format). See §14 (below in this section) for the format specification.
+The OASIS writer (`eda_router/src/oasis_writer.cpp`) and binary delta writer (`eda_router/src/binary_delta_writer.cpp`) are planned additions to the `eda_router` project. See §12 Build System and §13 Via Rule Handling for the planned interface. Both files are not yet present in the codebase.
 
 ---
 
@@ -194,7 +194,7 @@ Thread-affinity rules are enforced by each server's `dispatch_tool()` override. 
 
 ## 4. Library Map
 
-Thirteen libraries. Build order is topological; each is a `.a` static archive except `libpybindings.so`. Paths are relative to `vlsi/eda_tools/routing_genetic_astar/`.
+> **Note on current vs planned build structure.** The `routing_genetic_astar` namespace is the intended logical factoring — the include headers under `eda_router/include/routing_genetic_astar/` define 13 sub-modules. The current `CMakeLists.txt` compiles the I/O and planner sources into a single static library (`routing_genetic_astar_io`, aliased as `eda_router_io`) and links everything else as header-only into the `vlsi_daemon` / `eda_daemon` executables. The 13-library split below describes the **target architecture** that the headers are already organised around, not the current build artefacts. Paths are relative to `vlsi/eda_tools/eda_router/`.
 
 ```mermaid
 graph LR
@@ -265,39 +265,79 @@ graph LR
 
 ## 5. Directory Layout
 
-All paths relative to `vlsi/eda_tools/routing_genetic_astar/`. Shape mirrors the library map from §3.
+The `eda_tools/` tree contains three sibling projects: the router (`eda_router`), the placer (`eda_placer`), and the JSON-RPC gateway daemon (`eda_cli`). `eda_cli`'s CMakeLists.txt consumes the other two via `add_subdirectory`.
 
 ```text
-include/routing_genetic_astar/
-  core/             types.hpp        grid_graph.hpp        (+ .inl)
-  analysis/         design_analyzer.hpp  congestion_oracle.hpp  pin_access_oracle.hpp  context_classifier.hpp
-  planner/          global_planner.hpp   corridor_refinement.hpp  grid_fill.hpp
-  threading/        thread_manager.hpp    ← ONLY dir including <thread>/<barrier>/<mutex>
-  routing/          spatial_partitioner.hpp  negotiated_routing_loop.hpp  history_cost_updater.hpp
-                    cross_region_mediator.hpp  detailed_grid_router.hpp  strategy_composer.hpp
-                    spine_fishbone_router.hpp  tree_router.hpp
-  constraints/      drc_penalty_model.hpp  electrical_constraint_engine.hpp
-  convergence/      convergence_monitor.hpp  ilp_solver.hpp
-  eco/              eco_router.hpp
-  evaluation/       route_evaluator.hpp  adaptive_penalty_controller.hpp  optuna_tuner.hpp
-  transport/        websocket_transport.hpp  http_transport.hpp
-  mcp/              mcp_server_base.hpp  tool_registry.hpp  tool_client.hpp
-      servers/      db_mcp_server.hpp  windows_mcp_server.hpp  placement_mcp_server.hpp
-                    routing_mcp_server.hpp  editing_mcp_server.hpp  viewing_mcp_server.hpp
-  python/           py_routing_bindings.hpp  py_mcp_bindings.hpp
-
-src/                ← mirrors include/, one .cpp per .hpp
-
-python/
-  routing_genetic_astar/      __init__.py   routing.py   mcp.py
-  bindings/                    py_routing_bindings.cpp   py_mcp_bindings.cpp
-  CMakeLists.txt
-
-tests/
-  cpp/<module>/                test_<class>.cpp   ← Catch2, one file per class
-  python/                       test_routing_bindings.py  test_mcp_bindings.py
-  integration/                  test_end_to_end_route.cpp  test_mcp_round_trip.py
+vlsi/eda_tools/
+│
+├── eda_router/               ← Router project (CMake project: eda_router)
+│   ├── CMakeLists.txt        builds: routing_genetic_astar_io (static lib, alias eda_router_io)
+│   │                                 vlsi_daemon (standalone router executable)
+│   ├── src/
+│   │   ├── vlsi_daemon.cpp          Standalone router daemon entry point (WebSocket JSON-RPC)
+│   │   ├── routing_pipeline.cpp     Top-level routing pipeline orchestration
+│   │   ├── io/
+│   │   │   └── def_design_loader.cpp  DEF/LEF design reader  ┐ compiled into
+│   │   └── planner/                                           │ routing_genetic_astar_io
+│   │       └── grid_fill.cpp          Grid fill helper        ┘
+│   │
+│   ├── include/
+│   │   ├── eda_router/              Gateway-level headers
+│   │   │   ├── io/
+│   │   │   ├── mcp/servers/
+│   │   │   └── transport/
+│   │   └── routing_genetic_astar/   Algorithm namespace headers (header-only sub-modules)
+│   │       ├── core/          types.hpp  grid_graph.hpp  (+ .inl)
+│   │       ├── analysis/      design_analyzer.hpp  congestion_oracle.hpp
+│   │       │                  pin_access_oracle.hpp  context_classifier.hpp
+│   │       ├── planner/       global_planner.hpp  corridor_refinement.hpp  grid_fill.hpp
+│   │       ├── threading/     thread_manager.hpp   ← ONLY dir including <thread>/<barrier>
+│   │       ├── routing/       spatial_partitioner.hpp  negotiated_routing_loop.hpp
+│   │       │                  cross_region_mediator.hpp  detailed_grid_router.hpp
+│   │       │                  strategy_composer.hpp  spine_fishbone_router.hpp  tree_router.hpp
+│   │       ├── constraints/   drc_penalty_model.hpp  electrical_constraint_engine.hpp
+│   │       ├── convergence/   convergence_monitor.hpp  ilp_solver.hpp
+│   │       ├── eco/           eco_router.hpp
+│   │       ├── evaluation/    route_evaluator.hpp  adaptive_penalty_controller.hpp
+│   │       │                  optuna_tuner.hpp
+│   │       ├── transport/     websocket_transport.hpp  http_transport.hpp
+│   │       ├── mcp/           mcp_server_base.hpp  tool_registry.hpp  tool_client.hpp
+│   │       │   └── servers/   db_mcp_server.hpp  routing_mcp_server.hpp  ...
+│   │       └── io/            (router-internal I/O helpers)
+│   │
+│   ├── tests/                 CTest executables — one per sub-module
+│   │   ├── test_grid_graph.cpp
+│   │   ├── test_design_analyzer.cpp
+│   │   ├── test_global_planner.cpp
+│   │   ├── test_detailed_grid_router.cpp
+│   │   ├── test_convergence_monitor.cpp
+│   │   ├── test_strategy_composer.cpp
+│   │   └── smoke_test.sh
+│   ├── python/                Python integration helpers
+│   └── docs/
+│
+├── eda_placer/               ← Placer project (CMake project: eda_placer)
+│   ├── CMakeLists.txt        builds: eda_placer (static lib)
+│   ├── src/
+│   │   ├── analog_placer.cpp       Analog/custom cell placement
+│   │   └── analytical_placer.cpp   Force-directed analytical placement
+│   └── tests/
+│       └── test_analog_placer.cpp
+│
+├── eda_cli/                  ← JSON-RPC gateway (CMake project: eda_cli)
+│   ├── CMakeLists.txt        add_subdirectory(eda_router, eda_placer)
+│   │                         builds: eda_daemon (links eda_router_io + eda_placer)
+│   └── src/
+│       ├── main.cpp
+│       └── eda_daemon.cpp           WebSocket JSON-RPC dispatcher
+│
+└── python/
+    └── constraints_tool/
+        ├── constraints.py           SPICE → analog_problem parser
+        └── mcp_server.py            MCP server exposing constraints.extract
 ```
+
+> **Two daemons:** `eda_daemon` (from `eda_cli/`) is the main agent-facing JSON-RPC gateway that links both router and placer. `vlsi_daemon` (from `eda_router/`) is a self-contained router-only daemon used for standalone router development and testing. Both use the same `routing_genetic_astar` headers.
 
 
 
@@ -609,8 +649,8 @@ public:
 <details>
 <summary><b>libpybindings.so</b> — two PYBIND11_MODULE entries</summary>
 
-- `routing_genetic_astar.routing` — `RoutingGridGraph`, `GlobalPlanner`, `NegotiatedRoutingLoop`, `RouteEvaluator`, `EcoRouter` and core types.
-- `routing_genetic_astar.mcp` — `ToolClient`, `McpError`.
+- `routing_genetic_astar.routing` — `RoutingGridGraph`, `GlobalPlanner`, `NegotiatedRoutingLoop`, `RouteEvaluator`, `EcoRouter` and core types. (headers in `eda_router/include/routing_genetic_astar/`)
+- `routing_genetic_astar.mcp` — `ToolClient`, `McpError`. (headers in `eda_router/include/routing_genetic_astar/mcp/`)
 
 `std::expected<T,E>` is mapped to Python exceptions at the boundary. NumPy arrays are accepted for bulk coordinate data via `pybind11/numpy.h`.
 
@@ -782,8 +822,8 @@ pybind11 was chosen: Apache 2.0 license, header-only, industry standard (PyTorch
 
 | Python module | Source file | Exposes |
 |---|---|---|
-| `routing_genetic_astar.routing` | `python/bindings/py_routing_bindings.cpp` | `RoutingGridGraph`, `GlobalPlanner`, `NegotiatedRoutingLoop`, `RouteEvaluator`, `EcoRouter`, all core types |
-| `routing_genetic_astar.mcp` | `python/bindings/py_mcp_bindings.cpp` | `ToolClient`, `McpError` |
+| `routing_genetic_astar.routing` | `eda_router/python/bindings/py_routing_bindings.cpp` | `RoutingGridGraph`, `GlobalPlanner`, `NegotiatedRoutingLoop`, `RouteEvaluator`, `EcoRouter`, all core types |
+| `routing_genetic_astar.mcp` | `eda_router/python/bindings/py_mcp_bindings.cpp` | `ToolClient`, `McpError` |
 
 <details>
 <summary><b><code>std::expected</code> → Python exception mapping</b></summary>
@@ -912,24 +952,53 @@ tm_.submit([&] { ioc.run(); });   // I/O thread via ThreadManager — never dire
 
 ## 12. Build System
 
-| Target | Action |
+### Current CMake targets (actual)
+
+The build system currently uses CMake, not Make. Each project builds independently; `eda_cli` uses `add_subdirectory` to pull in `eda_router` and `eda_placer`.
+
+**`eda_router/` — `cmake --build build`**
+
+| Target | Type | Contents |
+|---|---|---|
+| `routing_genetic_astar_io` (alias `eda_router_io`) | Static lib | `src/io/def_design_loader.cpp`, `src/planner/grid_fill.cpp` |
+| `vlsi_daemon` | Executable | `src/vlsi_daemon.cpp`, `src/routing_pipeline.cpp`; links `eda_router_io` |
+| `test_grid_graph` | Test executable | CTest — runs via `ctest --test-dir build` |
+| `test_design_analyzer` | Test executable | CTest |
+| `test_global_planner` | Test executable | CTest |
+| `test_detailed_grid_router` | Test executable | CTest |
+| `test_convergence_monitor` | Test executable | CTest |
+| `test_strategy_composer` | Test executable | CTest |
+
+Optional dependencies detected at configure time:
+- `ortools` — enables ILP fallback solver (`-DHAVE_OR_TOOLS`)
+- `pybind11` — enables Optuna offline meta-tuner (`-DHAVE_PYBIND11`)
+
+**`eda_cli/` — `cmake --build build`**
+
+| Target | Type | Contents |
+|---|---|---|
+| `eda_daemon` | Executable | `src/main.cpp`, `src/eda_daemon.cpp`; links `eda_router_io` + `eda_placer` |
+
+**`eda_placer/` — `cmake --build build`**
+
+| Target | Type | Contents |
+|---|---|---|
+| `eda_placer` | Static lib | `src/analog_placer.cpp`, `src/analytical_placer.cpp` |
+
+### Planned additional targets
+
+The following targets are not yet in the CMakeLists.txt but are planned as part of the dual-output architecture:
+
+| Target | Description |
 |---|---|
-| `make all` | Build all 13 libs + `pybindings.so` + `oasis_writer` in dependency order |
-| `make lib<name>` | Build individual library |
-| `make liboasis` | Build the standalone OASIS streaming writer (`libeda_oasis.a`) |
-| `make test-all` | Catch2 unit tests + pytest integration tests |
-| `make test-<mod>` | Module-specific tests (e.g. `make test-threading`) |
-| `make test-oasis` | OASIS writer round-trip tests (write → read back with KLayout) |
-| `make format` | `clang-format` on all headers and sources |
-| `make lint` | `clang-tidy` on all sources |
-| `make docker-build` | Build multi-stage Docker image (`vlsi-agent:latest`) — compiles C++ in builder stage, copies `eda_daemon` binary into the Python runtime image |
-| `make docker-klayout` | Build the KLayout + noVNC sidecar image (`vlsi-klayout:latest`) from `docker/klayout/Dockerfile` |
-| `make docker-push` | Tag and push both images to the configured registry |
-| `make ci` | docker-build + docker-klayout + `all test-all BUILD_MODE=release` inside container |
-| `make clean` | Remove build artifacts |
+| `routing_genetic_astar_oasis` | Streaming OASIS encoder static lib (`src/oasis_writer.cpp`) — planned in `eda_router/` |
+| `test-oasis` | OASIS writer round-trip test (write → KLayout verify) — planned |
+| `docker-build` | Multi-stage Docker image (`vlsi-agent:latest`) — compiles C++ in builder stage (`FROM gcc:13`), copies `eda_daemon` into Python runtime stage (`FROM python:3.12-slim`) |
+| `docker-klayout` | KLayout + noVNC sidecar image (`vlsi-klayout:latest`) from `docker/klayout/Dockerfile` |
+| `docker-push` | Tag and push both images to configured registry |
 
 The main Docker image uses a two-stage build:
-1. **Builder stage** (`FROM gcc:13`) — compiles all C++ libraries and the `eda_daemon` binary with all dependencies including `libeda_oasis.a`.
+1. **Builder stage** (`FROM gcc:13`) — runs `cmake --build` for `eda_cli/` (which pulls in `eda_router` and `eda_placer`); produces `eda_daemon` binary.
 2. **Runtime stage** (`FROM python:3.12-slim`) — installs the Python agent, copies `eda_daemon`, sets the default entrypoint to `server.py`. The same image also serves `eda_daemon` and `constraints` compose services via `command:` overrides.
 
 The KLayout image (`docker/klayout/Dockerfile`) is a separate image:
@@ -941,7 +1010,7 @@ The KLayout image (`docker/klayout/Dockerfile`) is a separate image:
 <details>
 <summary><b>OASIS writer — design notes</b></summary>
 
-`vlsi/eda_tools/eda_cli/oasis_writer.cpp` implements a streaming OASIS encoder with no external library dependency. OASIS (Open Artwork System Interchange Standard — SEMI P39) uses a straightforward binary encoding:
+`vlsi/eda_tools/eda_router/src/oasis_writer.cpp` (planned) will implement a streaming OASIS encoder with no external library dependency. OASIS (Open Artwork System Interchange Standard — SEMI P39) uses a straightforward binary encoding:
 
 - **Records** are typed with a 1-byte record type followed by packed fields
 - **Coordinates** are delta-encoded relative to the previous shape on the same layer (reduces file size 3–5×)
@@ -951,7 +1020,7 @@ The KLayout image (`docker/klayout/Dockerfile`) is a separate image:
 The writer is append-only (streaming): the daemon calls `OASISWriter::begin_cell()`, then `OASISWriter::write_path()` / `write_rect()` in a loop, then `OASISWriter::end_cell()`. No random access to the file is needed, so memory usage is O(1) regardless of shape count.
 
 ```cpp
-// eda_cli/oasis_writer.h
+// eda_router/include/eda_router/oasis_writer.h  (planned)
 class OASISWriter {
 public:
     explicit OASISWriter(const std::string& path);
@@ -1009,22 +1078,23 @@ Via rules are structurally different from metal spacing rules. A via involves **
 
 ### 13.1 Two-stage architecture
 
-**Stage 1 — Topology planner (`routing_genetic_astar`):**
+**Stage 1 — Topology planner (`routing_genetic_astar` namespace, in `eda_router/`):**
 Plans wire centerlines and layer transitions on a routing grid. At each layer-change point it records a *via placeholder* with a via-type tag and the selected track coordinates. The planner only needs the via *footprint* (bounding box of the full assembled via structure on each layer) to verify that sufficient space exists. It does not generate cut geometry.
 
-**Stage 2 — Via expander (`via_expander.cpp`):**
+**Stage 2 — Via expander (`eda_router/src/via_expander.cpp` — planned):**
 After routing is complete, walks every via placeholder in net order, selects the via type and array dimensions, generates the three-layer geometry (lower-metal landing pad, cut shapes, upper-metal landing pad), performs a local conflict check, and emits all shapes into the binary delta and OASIS writer.
 
 ```
-route_nets() call
-    ┣━ Stage 1 — A* topology planner
+route_nets() call                                [eda_router/src/routing_pipeline.cpp]
+    ┣━ Stage 1 — A* topology planner            [routing_genetic_astar namespace]
     │     inputs:  netlist, routing grid, via_tech JSON, layer graph
     │     outputs: RouteTopology {wire_segments[], via_placeholders[]}
-    ┗━ Stage 2 — ViaExpander::expand(topology, via_tech)
+    ┗━ Stage 2 — ViaExpander::expand(topology, via_tech)   [eda_router/src/via_expander.cpp — planned]
           ┣━ select via type + compute array dimensions
           ┣━ generate 3-layer geometry per placeholder
           ┣━ conflict check vs. already-emitted shapes
-          ┗━ emit to OASISWriter + BinaryDeltaWriter
+          ┗━ emit to OASISWriter + BinaryDeltaWriter        [eda_router/src/oasis_writer.cpp +
+                                                             eda_router/src/binary_delta_writer.cpp — planned]
 ```
 
 ### 13.2 Via technology data — extraction and format

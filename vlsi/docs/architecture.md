@@ -7,7 +7,7 @@
 This architecture fulfills the goal of orchestrating autonomous electronic design automation (EDA) workflows across **two cooperating tool layers** under a single LangGraph orchestrator.
 
 - **Internal Tool Layer** — production algorithms that run *inside* a proprietary EDA host (Cadence Virtuoso, Synopsys ICC2, KLayout). The orchestrator reaches them through a thin **Host Execution Agent (HEA)** embedded in the host process and dispatches self-contained **Execution Units (EUs)** that keep dense, iterative loops (DRC fixes, place-and-route convergence) inside host memory. No UI lockups, no per-iteration IPC.
-- **External Tool Layer** — the compiled C++ `eda_daemon` (with its `routing_genetic_astar`, `eda_placer`, DB reader, window automation libraries) and Python MCP tools (e.g., constraints parser). These run as separate processes and communicate over WebSocket JSON-RPC. This layer is the home of custom research algorithms and tool-neutral utilities.
+- **External Tool Layer** — the compiled C++ `eda_daemon` (links `eda_router_io` for routing, `eda_placer` for placement, plus DB reader and window automation) and Python MCP tools (e.g., constraints parser). These run as separate processes and communicate over WebSocket JSON-RPC. This layer is the home of custom research algorithms and tool-neutral utilities.
 
 Several capabilities — notably the router and placer — are present in **both** layers. A host's production router is battle-tested on real silicon; a custom C++ router may explore a novel algorithm on the same netlist. The orchestrator treats these as peer implementations and picks between them according to an explicit routing policy.
 
@@ -109,7 +109,7 @@ The stack is organized into an **orchestration plane** (host-agnostic) and two *
 
 | Component | Process / Port | File(s) | Responsibility |
 |---|---|---|---|
-| **C++ Daemon** | Native binary · `:8080` (WS) | `vlsi/eda_tools/eda_cli/` | JSON-RPC gateway; router / placer / DB / window all linked in one process sharing a `SharedDatabase` |
+| **C++ Daemon** | Native binary · `:8080` (WS) | `vlsi/eda_tools/eda_cli/` | JSON-RPC gateway (`eda_daemon`); links `eda_router_io` + `eda_placer`; all algorithms share a `SharedDatabase` |
 | **Constraints MCP tool** | Python MCP · `:18081` | `vlsi/eda_tools/python/constraints_tool/` | Parses SPICE into a tool-neutral `analog_problem`; used by the placer path |
 
 ### 3.3 Internal tool layer (host-embedded, EU pattern)
@@ -141,7 +141,7 @@ The stack is organized into an **orchestration plane** (host-agnostic) and two *
 | Component | Process / Port | File(s) | Responsibility |
 |---|---|---|---|
 | **KLayout service** | Container · headless + VNC · `:5900` / `:6080` | `docker/klayout/` | Three roles: (1) headless geometric DRC engine against OASIS delta files; (2) graphical debug viewer accessible via browser (noVNC `:6080`); (3) optional standalone layout editor for result inspection before committing to live EDA DB |
-| **OASIS delta writer** | Inside C++ daemon | `vlsi/eda_tools/eda_cli/oasis_writer.cpp` | Writes the routing / placement result as an OASIS file to the shared volume alongside the binary delta — used as input to KLayout DRC and the debug viewer |
+| **OASIS delta writer** | Inside C++ daemon | `vlsi/eda_tools/eda_router/src/oasis_writer.cpp` (planned) | Writes the routing / placement result as an OASIS file to the shared volume alongside the binary delta — used as input to KLayout DRC and the debug viewer |
 | **DRC script generator** | Inside agent process | `vlsi/agent/src/drc/drc_script_gen.py` | Converts extracted techfile rules (JSON) into a KLayout Ruby DRC script; runs KLayout headlessly and parses the `.rdb` violation report back to a structured JSON |
 | **Techfile rule extractor** | HEA EU (one-shot) | `eu_registry/{host}/extract_tech_rules.{skill,tcl}.j2` | Reads `techGetLayerParamValue` (SKILL) or `tech::get_rule` (Tcl) to produce a rules JSON: `{layer, minWidth, minSpacing, minEnclosure, minArea, ...}` per layer and layer-pair |
 | **Shared volume** | Bind-mount | `/tmp/eda_share` (host) ↔ `/eda_share` (container) | Staging area for binary delta files, OASIS files, DRC scripts, and violation reports |
@@ -249,7 +249,7 @@ Graph A sees the world as **capabilities** (route nets, place cells, query DB, a
 
 | Capability | Internal (HEA / EU) | External (C++ daemon) | Default policy |
 |---|---|---|---|
-| Route nets (`route_nets`) | ✓ Host router via EU (`route_nets.skill.j2`, `route_nets.tcl.j2`) | ✓ `routing_genetic_astar` | Internal-first, external as cross-check or fallback |
+| Route nets (`route_nets`) | ✓ Host router via EU (`route_nets.skill.j2`, `route_nets.tcl.j2`) | ✓ `eda_router` (`routing_genetic_astar` namespace) | Internal-first, external as cross-check or fallback |
 | Place cells (`place_cells`) | ✓ Host placer via EU | ✓ `eda_placer` (+ constraints MCP) | Internal-first, external for custom analog flows or when SPICE path is requested |
 | DB queries (`db.*`) | ✓ Direct host DB via EU | ✓ DB reader | Internal-first (host DB is authoritative) |
 | Window automation (`view.*`) | ✓ Host native UI via EU + Window Adapter | ✓ KLayout-only via viewer commands | Always **internal** if the user is in a proprietary host; external for KLayout dock |
@@ -606,7 +606,7 @@ Six anti-coupling guarantees the code base enforces:
 
 1. **No Python module calls another Python module directly.** `m1` never imports from `m2`. Cross-module communication goes through Graph A or through a tool-layer contract (daemon JSON-RPC or HEA MCP).
 2. **No C++ module calls another C++ module through Python.** Router/Placer/DB all share one process memory via `SharedDatabase`. Inter-module calls are direct C++ function calls inside the daemon binary — never a round-trip through Python.
-3. **`eda_cli` is the gateway, not an algorithm.** Algorithm modules (e.g. `routing_genetic_astar`, `eda_placer`) are compiled as libraries and linked into the daemon.
+3. **`eda_cli` is the gateway, not an algorithm.** Algorithm modules (`eda_router_io` from the `eda_router` project, and `eda_placer`) are compiled as static libraries and linked into `eda_daemon`. The `routing_genetic_astar` namespace lives under `eda_router/include/`.
 4. **Workflows own their iteration logic.** `w1`, `w2` use module subgraphs internally but expose only `start` / `finished` to Graph A.
 5. **The HEA is not a graph runtime.** Its only job is to receive EUs, execute them on the host's main thread, and expose the state store. All orchestration logic — sequencing, conditionals, retries, analyze-then-augment — lives in LangGraph. No SKILL/Tcl graph DSL, no duplicate orchestrator.
 6. **Layer selection is policy, not code.** Modules do not hard-code a layer. The policy router reads `layer_pref` off state and drives the branch selection; adding a new layer (or a new internal host) does not require touching the module bodies.
@@ -1080,13 +1080,31 @@ vlsi/agent/
       klayout_client.py                HTTP client for KLayout DRC trigger endpoint
 
 vlsi/eda_tools/
-  eda_cli/                             C++ CLI + MCP gateway (daemon)
-    oasis_writer.cpp / .h              Streaming OASIS encoder (no external dep)
-  routing_genetic_astar/               router library
-    via_expander.cpp / .h              Stage 2: via type selection, array sizing, 3-layer geometry
-    binary_delta_writer.cpp / .h       Flat binary delta writer (20 B/shape)
-  eda_placer/                          placer library (WIP)
+  eda_cli/                             JSON-RPC gateway — builds eda_daemon (links eda_router + eda_placer)
+    src/main.cpp
+    src/eda_daemon.cpp
+  eda_router/                          Router project — builds routing_genetic_astar_io (static lib) + vlsi_daemon
+    CMakeLists.txt
+    src/
+      vlsi_daemon.cpp                  Standalone router daemon (development / testing)
+      routing_pipeline.cpp             Top-level routing orchestration
+      io/def_design_loader.cpp         DEF/LEF design reader  ┐ compiled into
+      planner/grid_fill.cpp            Grid fill helper        ┘ routing_genetic_astar_io
+      via_expander.cpp / .h            [planned] Stage 2 via type selection, array sizing, 3-layer geometry
+      oasis_writer.cpp / .h            [planned] Streaming OASIS encoder (no external dep)
+      binary_delta_writer.cpp / .h     [planned] Flat binary delta writer (20 B/shape)
+    include/
+      eda_router/                      Gateway-level headers (io, mcp, transport)
+      routing_genetic_astar/           Algorithm namespace headers (core, analysis, planner, routing,
+                                       constraints, convergence, eco, evaluation, transport, mcp, threading)
+    tests/                             CTest unit tests (test_grid_graph, test_design_analyzer, ...)
+  eda_placer/                          Placer project — builds eda_placer (static lib)
+    src/analog_placer.cpp
+    src/analytical_placer.cpp
+    tests/test_analog_placer.cpp
   python/constraints_tool/             Python constraints MCP server
+    constraints.py
+    mcp_server.py
 
 docker/
   Dockerfile                           Multi-stage build (C++ + Python + agent)
@@ -1171,7 +1189,7 @@ docker/
 | **noVNC** | Browser-based VNC client; exposes the KLayout GUI at `http://localhost:6080` without requiring a VNC client app |
 | **/eda_share** | Bind-mounted staging volume shared between all Docker services and the host; ephemeral — cleared after each job |
 | **Techfile rule extractor** | One-shot HEA EU that reads `techGetLayerParamValue` (SKILL) or `tech::get_rule` (Tcl) and returns a rules JSON used to generate the KLayout DRC script |
-| **OASIS writer** | Streaming C++ encoder in `oasis_writer.cpp`; produces standard OASIS files with delta-encoded coordinates and no external library dependency |
+| **OASIS writer** | Planned streaming C++ encoder (`eda_router/src/oasis_writer.cpp`); will produce standard OASIS files with delta-encoded coordinates and no external library dependency |
 
 ---
 
