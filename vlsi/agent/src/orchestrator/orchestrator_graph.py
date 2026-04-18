@@ -101,11 +101,12 @@ class OrchestratorState(TypedDict):
         Flag set by KLayout when it sends a request (UI is locked).
         Cleared by "unlock_ui" viewer command after response.
     """
-    messages:       Annotated[Sequence[BaseMessage], operator.add]
-    active_intent:  str
-    intent_params:  dict[str, Any]
+    messages:        Annotated[Sequence[BaseMessage], operator.add]
+    active_intent:   str
+    intent_params:   dict[str, Any]
     viewer_commands: list[dict[str, Any]]
-    layout_locked:  bool
+    layout_locked:   bool
+    job_id:          str   # trace correlation ID
 
 
 # ─── Node: parse_intent ───────────────────────────────────────────────────────

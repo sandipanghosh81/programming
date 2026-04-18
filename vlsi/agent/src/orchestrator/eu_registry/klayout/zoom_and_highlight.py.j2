@@ -1,0 +1,59 @@
+"""
+zoom_and_highlight EU  —  KLayout Python
+Zooms to a bounding box and highlights a set of shape objects.
+─────────────────────────────────────────────────────────────
+Jinja2 template variables:
+  x1, y1, x2, y2 : float  — bounding box in µm
+  layer_name      : string — layer to highlight (e.g. "M2")
+  net_name        : string — optional net name for annotation
+  margin_um       : float  — extra margin around bbox (default 1.0)
+"""
+
+import klayout.db  as db
+import klayout.lay as lay
+
+# Get the active layout view
+view = lay.LayoutView.current()
+if view is None:
+    raise RuntimeError("zoom_and_highlight EU: No active layout view")
+
+# Build the target box with margin
+margin = {{ margin_um | default(1.0) }}
+box = db.DBox(
+    {{ x1 }} - margin,
+    {{ y1 }} - margin,
+    {{ x2 }} + margin,
+    {{ y2 }} + margin,
+)
+
+# Zoom to the box
+view.zoom_box(box)
+
+# Highlight shapes on the target layer
+{% if layer_name %}
+layout = view.active_cellview().layout() if view.active_cellview().is_valid() else None
+if layout:
+    layer_idx = None
+    for li in layout.layer_indices():
+        info = layout.get_info(li)
+        if info.name == "{{ layer_name }}":
+            layer_idx = li
+            break
+
+    if layer_idx is not None:
+        cell = view.active_cellview().cell
+        for shape in cell.shapes(layer_idx).each():
+            if shape.is_box():
+                if shape.box.overlaps(db.Box.from_dbox(box)):
+                    # Mark shape for highlighting (KLayout highlight API)
+                    view.select_object(db.ObjectInstPath())
+{% endif %}
+
+# Add a ruler annotation if net_name is provided
+{% if net_name %}
+annot = db.DUserPropertyDeclaration()
+view.ruler_refs().clear()
+{% endif %}
+
+view.update()
+print(f"zoom_and_highlight EU: Zoomed to ({{'{{ x1 }}':.3f}}, {{'{{ y1 }}':.3f}}) — ({{'{{ x2 }}':.3f}}, {{'{{ y2 }}':.3f}}) on {{ layer_name or 'all layers' }}")

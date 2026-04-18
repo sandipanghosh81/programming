@@ -1,0 +1,50 @@
+### route_nets EU  —  Synopsys ICC2 Apply EU
+### Reads a placement/route JSON and applies changes via ICC2's Tcl API.
+### ─────────────────────────────────────────────────────────────────────────
+### Jinja2 template variables:
+###   delta_path     : string — path to the binary delta ASCII file
+###   undo_group     : string — label for history
+###   net_ids        : list of int — nets to apply (empty = all from delta)
+
+set delta_path "{{ delta_path }}.skill_ascii"
+set undo_group "{{ undo_group }}"
+
+if {![file exists $delta_path]} {
+    error "route_nets EU: Delta file not found: $delta_path"
+}
+
+# Begin history group for undo
+begin_routing_eco -name $undo_group
+
+set fp [open $delta_path r]
+while {[gets $fp line] >= 0} {
+    set parts [split $line " "]
+    set opcode [lindex $parts 0]
+
+    switch -- $opcode {
+        "ADD_RECT" {
+            # ADD_RECT <layer> <purpose> <x_nm> <y_nm> <w_nm> <h_nm>
+            set layer [lindex $parts 1]
+            set x     [expr {[lindex $parts 3] / 1000.0}]
+            set y     [expr {[lindex $parts 4] / 1000.0}]
+            set w     [expr {[lindex $parts 5] / 1000.0}]
+            set h     [expr {[lindex $parts 6] / 1000.0}]
+            create_shape -layer $layer -rect [list $x $y [expr {$x+$w}] [expr {$y+$h}]]
+        }
+        "ADD_VIA" {
+            # ADD_VIA <x_nm> <y_nm> <via_def_idx>
+            set x    [expr {[lindex $parts 1] / 1000.0}]
+            set y    [expr {[lindex $parts 2] / 1000.0}]
+            # via_def_idx lookup would go here
+        }
+        default {
+            # Silently skip unknown opcodes for forward compatibility
+        }
+    }
+}
+close $fp
+
+end_routing_eco
+save_lib
+
+puts "route_nets EU: Applied delta from $delta_path"

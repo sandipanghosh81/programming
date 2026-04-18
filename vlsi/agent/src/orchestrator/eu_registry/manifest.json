@@ -1,0 +1,80 @@
+{
+  "version": "1.0",
+  "description": "EU Registry — Execution Unit templates for VLSI agent",
+  "templates": [
+    {
+      "id":          "cadence_virtuoso/extract_tech_rules",
+      "host":        "cadence_virtuoso",
+      "language":    "skill",
+      "file":        "cadence_virtuoso/extract_tech_rules.skill.j2",
+      "description": "Extract geometric DRC rules (min-width, min-space, min-area) from live Virtuoso techfile",
+      "required_args": ["output_path", "layer_names"],
+      "phase":        "extract_rules"
+    },
+    {
+      "id":          "cadence_virtuoso/extract_via_tech",
+      "host":        "cadence_virtuoso",
+      "language":    "skill",
+      "file":        "cadence_virtuoso/extract_via_tech.skill.j2",
+      "description": "Extract via cut rule definitions (cut size, enclosure, pitch) from Virtuoso techfile",
+      "required_args": ["output_path", "via_names"],
+      "phase":        "extract_rules"
+    },
+    {
+      "id":          "cadence_virtuoso/route_nets",
+      "host":        "cadence_virtuoso",
+      "language":    "skill",
+      "file":        "cadence_virtuoso/route_nets.skill.j2",
+      "description": "Apply routing changes (binary delta) to the live Virtuoso OA database inside a single undo group",
+      "required_args": ["delta_path", "undo_group"],
+      "optional_args": ["via_def_names", "timeout_s"],
+      "phase":        "apply"
+    },
+    {
+      "id":          "cadence_virtuoso/place_cells",
+      "host":        "cadence_virtuoso",
+      "language":    "skill",
+      "file":        "cadence_virtuoso/place_cells.skill.j2",
+      "description": "Place standard cells from a JSON placement result file",
+      "required_args": ["placement_json", "undo_group", "library_name", "cell_name"],
+      "phase":        "apply"
+    },
+    {
+      "id":          "synopsys_icc2/extract_tech_rules",
+      "host":        "synopsys_icc2",
+      "language":    "tcl",
+      "file":        "synopsys_icc2/extract_tech_rules.tcl.j2",
+      "description": "Extract layer DRC rules from ICC2 tech database",
+      "required_args": ["output_path", "layer_names"],
+      "phase":        "extract_rules"
+    },
+    {
+      "id":          "synopsys_icc2/extract_via_tech",
+      "host":        "synopsys_icc2",
+      "language":    "tcl",
+      "file":        "synopsys_icc2/extract_via_tech.tcl.j2",
+      "description": "Extract via rule definitions from ICC2 tech database",
+      "required_args": ["output_path", "via_names"],
+      "phase":        "extract_rules"
+    },
+    {
+      "id":          "synopsys_icc2/route_nets",
+      "host":        "synopsys_icc2",
+      "language":    "tcl",
+      "file":        "synopsys_icc2/route_nets.tcl.j2",
+      "description": "Apply routing changes to ICC2 design via routing ECO API",
+      "required_args": ["delta_path", "undo_group"],
+      "phase":        "apply"
+    },
+    {
+      "id":          "klayout/zoom_and_highlight",
+      "host":        "klayout",
+      "language":    "python",
+      "file":        "klayout/zoom_and_highlight.py.j2",
+      "description": "Zoom to a bounding box and optionally highlight shapes on a named layer",
+      "required_args": ["x1", "y1", "x2", "y2"],
+      "optional_args": ["layer_name", "net_name", "margin_um"],
+      "phase":        "view"
+    }
+  ]
+}

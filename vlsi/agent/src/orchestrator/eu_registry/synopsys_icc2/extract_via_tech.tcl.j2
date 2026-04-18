@@ -1,0 +1,47 @@
+### extract_via_tech EU  —  Synopsys ICC2 / Tcl
+### Reads via cut rule definitions from ICC2 tech and writes JSON.
+### ─────────────────────────────────────────────────────────────────────────
+### Jinja2 template variables:
+###   output_path : string
+###   via_names   : list of string — via rule names
+
+set output_path "{{ output_path }}"
+set via_names { {% for v in via_names %}"{{ v }}" {% endfor %} }
+
+set via_entries {}
+
+foreach via_name $via_names {
+    set cut_layer    0
+    set cut_w        0.14
+    set cut_h        0.14
+    set enc_m1       0.03
+    set enc_m2       0.03
+    set pitch_x      0.34
+    set pitch_y      0.34
+
+    if {![catch {
+        set via_obj [get_via_rules $via_name]
+        set cut_layer [get_attribute [get_layers [get_attribute $via_obj cut_layer_name]] mask_order]
+        set cut_layer [lindex $cut_layer 0]
+        set cut_w     [get_attribute $via_obj cut_width]
+        set cut_h     [get_attribute $via_obj cut_height]
+        set enc_m1    [get_attribute $via_obj lower_enclosure]
+        set enc_m2    [get_attribute $via_obj upper_enclosure]
+        set pitch_x   [get_attribute $via_obj column_pitch]
+        set pitch_y   [get_attribute $via_obj row_pitch]
+    } err]} {}
+
+    lappend via_entries [format \
+        "{\"name\":\"%s\",\"cut_layer\":%d,\"cut_purpose\":0,\"cut_w\":%d,\"cut_h\":%d,\"m1_layer\":0,\"m2_layer\":0,\"enc_m1_x\":%d,\"enc_m1_y\":%d,\"enc_m2_x\":%d,\"enc_m2_y\":%d,\"pitch_x\":%d,\"pitch_y\":%d,\"max_cols\":4,\"max_rows\":4}" \
+        $via_name $cut_layer \
+        [expr {int($cut_w * 1000)}] [expr {int($cut_h * 1000)}] \
+        [expr {int($enc_m1 * 1000)}] [expr {int($enc_m1 * 1000)}] \
+        [expr {int($enc_m2 * 1000)}] [expr {int($enc_m2 * 1000)}] \
+        [expr {int($pitch_x * 1000)}] [expr {int($pitch_y * 1000)}]]
+}
+
+set fp [open $output_path w]
+puts $fp "{\"via_defs\":[\n[join $via_entries \",\n\"]\n]}"
+close $fp
+
+puts "extract_via_tech: Written to $output_path"

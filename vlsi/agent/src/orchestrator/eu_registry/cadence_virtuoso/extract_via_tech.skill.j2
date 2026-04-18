@@ -1,0 +1,45 @@
+;;; extract_via_tech EU  —  Cadence Virtuoso / SKILL
+;;; Reads via constraint definitions from the techfile and emits JSON.
+;;; ─────────────────────────────────────────────────────────────────────────
+;;; Jinja2 template variables:
+;;;   output_path   : string — JSON output path on /eda_share
+;;;   via_names     : list of string — via type names to extract
+
+let( (techObj viaDef cutLayer cutW cutH encM1 encM2 pitchX pitchY jsonEntries)
+  setq(techObj techGetTechFile(geGetWindowCellView()->lib))
+  unless(techObj error("extract_via_tech: No techfile found"))
+
+  setq(jsonEntries nil)
+
+  {% for via in via_names %}
+  setq(viaDef techFindViaDefByName(techObj "{{ via }}"))
+  when(viaDef
+    setq(cutLayer  techGetViaDefCutLayer(techObj "{{ via }}"))
+    setq(cutW      techGetViaDefParam(techObj "{{ via }}" "cutWidth")     || 0.14)
+    setq(cutH      techGetViaDefParam(techObj "{{ via }}" "cutHeight")    || 0.14)
+    setq(encM1     techGetViaDefParam(techObj "{{ via }}" "enclosure1")   || 0.03)
+    setq(encM2     techGetViaDefParam(techObj "{{ via }}" "enclosure2")   || 0.03)
+    setq(pitchX    techGetViaDefParam(techObj "{{ via }}" "xPitch")       || 0.34)
+    setq(pitchY    techGetViaDefParam(techObj "{{ via }}" "yPitch")       || 0.34)
+    setq(jsonEntries append(jsonEntries list(
+      sprintf(nil
+        "{\"name\":\"{{ via }}\",\"cut_layer\":%d,\"cut_purpose\":0,\"cut_w\":%d,\"cut_h\":%d,\"m1_layer\":0,\"m2_layer\":0,\"enc_m1_x\":%d,\"enc_m1_y\":%d,\"enc_m2_x\":%d,\"enc_m2_y\":%d,\"pitch_x\":%d,\"pitch_y\":%d,\"max_cols\":4,\"max_rows\":4}"
+        techGetLayerNumber(techObj cutLayer)
+        (round (* cutW 1000)) (round (* cutH 1000))
+        (round (* encM1 1000)) (round (* encM1 1000))
+        (round (* encM2 1000)) (round (* encM2 1000))
+        (round (* pitchX 1000)) (round (* pitchY 1000))
+      )
+    )))
+  )
+  {% endfor %}
+
+  let( (fp result)
+    setq(result strcat("{\"via_defs\":[" buildString(jsonEntries ",\n") "]}"))
+    setq(fp outfile("{{ output_path }}" "w"))
+    fprintf(fp "%s\n" result)
+    close(fp)
+  )
+  printf("extract_via_tech: Written to {{ output_path }}\n")
+  "ok"
+)

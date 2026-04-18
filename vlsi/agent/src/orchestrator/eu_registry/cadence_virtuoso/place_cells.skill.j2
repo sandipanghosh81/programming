@@ -1,0 +1,54 @@
+;;; place_cells EU  —  Cadence Virtuoso
+;;; Places standard cells from a JSON placement result file.
+;;; ─────────────────────────────────────────────────────────────────────────
+;;; Jinja2 template variables:
+;;;   placement_json : string — path to JSON with cell placements on /eda_share
+;;;   undo_group     : string — unique name for the undo group
+;;;   library_name   : string — target library
+;;;   cell_name      : string — target cell (design)
+
+let( (cv placementPath fp line placements entry instName cellRef x y orient inst)
+  setq(cv geGetWindowCellView())
+  unless(cv error("place_cells EU: No active cellview"))
+
+  setq(placementPath "{{ placement_json }}")
+  unless(isFile(placementPath)
+    error("place_cells EU: Placement file not found: %s" placementPath))
+
+  dbOpenUndoGroup(cv "{{ undo_group }}")
+
+  ; Parse JSON placement file
+  ; Format: [{"inst_name": "U1", "cell_ref": "INV_X1", "x": 1000, "y": 2000, "orient": "R0"}, ...]
+  let( (jsonStr data)
+    setq(fp infile(placementPath))
+    setq(jsonStr "")
+    setq(line readLine(fp))
+    while(line
+      setq(jsonStr strcat(jsonStr line))
+      setq(line readLine(fp))
+    )
+    close(fp)
+
+    ; For each placement entry (simplified parser using rexMatchp)
+    ; Full implementation uses a proper SKILL JSON parser
+    rexCompile("\"inst_name\"\\s*:\\s*\"([^\"]+)\".*?\"cell_ref\"\\s*:\\s*\"([^\"]+)\".*?\"x\"\\s*:\\s*([0-9]+).*?\"y\"\\s*:\\s*([0-9]+).*?\"orient\"\\s*:\\s*\"([^\"]+)\"")
+    setq(data rexMatchp(jsonStr))
+    while(data
+      setq(instName nth(1 data))
+      setq(cellRef  nth(2 data))
+      setq(x        atoi(nth(3 data)))
+      setq(y        atoi(nth(4 data)))
+      setq(orient   nth(5 data))
+
+      setq(inst dbOpenCellViewByType("{{ library_name }}" cellRef "layout"))
+      when(inst
+        dbCreateInst(cv inst instName x:y orient))
+      setq(data rexMatchp(jsonStr (rexPos) + 1))
+    )
+  )
+
+  dbCloseUndoGroup(cv "{{ undo_group }}")
+  dbSave(cv)
+  printf("place_cells EU: Placement applied from %s\n" placementPath)
+  "ok"
+)

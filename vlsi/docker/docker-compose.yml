@@ -1,0 +1,143 @@
+# docker-compose.yml  —  VLSI Agent full stack
+# ─────────────────────────────────────────────────────────────────────────────
+# Services:
+#   agent       — Python FastAPI/LangGraph orchestrator
+#   eda-daemon  — C++ JSON-RPC routing/placement engine
+#   chromadb    — Vector store for RAG (EDA API docs)
+#   klayout     — KLayout headless DRC + noVNC debug viewer
+#
+# SHARED VOLUME:
+#   eda_share   — mounted at /eda_share on all services
+#                 C++ daemon writes OASIS + delta files here;
+#                 KLayout DRC reads OASIS; HEA Apply EU reads delta.
+#
+# USAGE:
+#   docker compose -f docker/docker-compose.yml up
+#   docker compose -f docker/docker-compose.yml down
+#
+# LINUX NOTE:
+#   host.docker.internal resolves to the Docker host via extra_hosts.
+#   The HEA (Virtuoso/ICC2) runs on the host, listening on 9090.
+
+version: "3.9"
+
+volumes:
+  eda_share:
+    driver: local
+  chromadb_data:
+    driver: local
+
+networks:
+  eda_net:
+    driver: bridge
+
+services:
+
+  # ── EDA C++ Daemon ─────────────────────────────────────────────────────────
+  eda-daemon:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: cpp-builder
+    image: vlsi-eda-daemon:latest
+    command: ["/usr/local/bin/eda_daemon", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - eda_share:/eda_share
+    networks:
+      - eda_net
+    mem_limit: 4g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo '{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"params\":{},\"id\":1}' | nc -q1 localhost 8080 | grep pong"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Python Agent ──────────────────────────────────────────────────────────
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: agent
+    image: vlsi-agent:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - eda_share:/eda_share
+    networks:
+      - eda_net
+    environment:
+      EDA_CLI_HOST:      eda-daemon
+      EDA_CLI_PORT:      "8080"
+      EDA_HEA_HOST:      host.docker.internal
+      EDA_HEA_PORT:      "9090"
+      CHROMADB_HOST:     chromadb
+      CHROMADB_PORT:     "8001"
+      KLAYOUT_HOST:      klayout
+      KLAYOUT_PORT:      "8002"
+      EDA_SHARE:         /eda_share
+      EDA_SHARE_MIN_FREE_MB: "500"
+      EDA_TRACE_FILE:    /eda_share/traces.jsonl
+      GOOGLE_API_KEY:    ${GOOGLE_API_KEY:-}
+    mem_limit: 2g
+    depends_on:
+      eda-daemon:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── ChromaDB Vector Store ─────────────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    networks:
+      - eda_net
+    mem_limit: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+      CHROMA_SERVER_HTTP_PORT: "8000"
+
+  # ── KLayout DRC Service + noVNC Debug Viewer ──────────────────────────────
+  klayout:
+    build:
+      context: ..
+      dockerfile: docker/klayout/Dockerfile
+    image: vlsi-klayout:latest
+    ports:
+      - "8002:8002"    # DRC HTTP API
+      - "6080:6080"    # noVNC browser viewer
+    volumes:
+      - eda_share:/eda_share
+    networks:
+      - eda_net
+    mem_limit: 2g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    environment:
+      EDA_SHARE: /eda_share
+      DISPLAY:   ":99"

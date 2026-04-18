@@ -1,0 +1,49 @@
+### extract_tech_rules EU  —  Synopsys ICC2 / Tcl
+### Reads routing rules from ICC2's tech database and writes a JSON file.
+### ─────────────────────────────────────────────────────────────────────────
+### Jinja2 template variables:
+###   output_path   : string — JSON output path on /eda_share
+###   layer_names   : list of string — layer names to extract
+
+set output_path "{{ output_path }}"
+set layer_names { {% for l in layer_names %}"{{ l }}" {% endfor %} }
+
+set json_layers {}
+
+foreach layer $layer_names {
+    set min_width 0.0
+    set min_space 0.0
+    set min_area  0.0
+    set layer_num 0
+
+    # Get layer number
+    if {![catch {set layer_num [get_attribute [get_layers $layer] mask_order]} err]} {
+        set layer_num [lindex $layer_num 0]
+    }
+
+    # Min width
+    if {![catch {set min_width [get_attribute [get_layers $layer] minimum_cut_width]} err]} {
+        set min_width [lindex $min_width 0]
+    }
+
+    # Min space
+    if {![catch {set min_space [get_attribute [get_layers $layer] minimum_spacing]} err]} {
+        set min_space [lindex $min_space 0]
+    }
+
+    # Min area
+    if {![catch {set min_area [get_attribute [get_layers $layer] minimum_area]} err]} {
+        set min_area [lindex $min_area 0]
+    }
+
+    lappend json_layers [format \
+        "{\"name\":\"%s\",\"layer\":%d,\"datatype\":0,\"min_width_um\":%.6f,\"min_space_um\":%.6f,\"min_area_um2\":%.9f}" \
+        $layer $layer_num $min_width $min_space $min_area]
+}
+
+# Write output JSON
+set fp [open $output_path w]
+puts $fp "{\"layers\":[\n[join $json_layers \",\n\"]\n],\"via_rules\":[]}"
+close $fp
+
+puts "extract_tech_rules: Written to $output_path"

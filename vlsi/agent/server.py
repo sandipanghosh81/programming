@@ -86,11 +86,16 @@ logger.info("Graph A ready.")
 class ChatRequest(BaseModel):
     """
     WHAT THE KLAYOUT MACRO SENDS:
-      {"message": "route the power rail VDD"}
+      {"message": "route the power rail VDD", "layer_pref": "M2"}
 
-    message: The raw text the user typed in the KLayout chatbot dock widget.
+    message:     The raw text the user typed in the KLayout chatbot dock widget.
+    layer_pref:  Optional preferred routing layer hint (e.g. "M1", "M2").
+                 Passed into intent_params so the router subgraph can use it.
+    session_id:  Optional session identifier for multi-turn trace correlation.
     """
-    message: str
+    message:    str
+    layer_pref: str | None = None
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -111,13 +116,71 @@ class ChatResponse(BaseModel):
 @app.get("/health")
 async def health_check():
     """
-    WHAT IT DOES: Quick sanity check.
+    WHAT IT DOES: Detailed health check — probes all downstream services.
     USAGE: curl http://127.0.0.1:8000/health
-    RETURNS: {"status": "ok", "agent": "ready"}
-
-    Use this to verify the server is running before starting KLayout.
+    RETURNS:
+      {
+        "status": "ok" | "degraded",
+        "agent": "ready",
+        "services": {
+          "eda_daemon":  "ok" | "unreachable",
+          "hea":         "ok" | "unreachable",
+          "chromadb":    "ok" | "unreachable",
+          "klayout_drc": "ok" | "unreachable"
+        }
+      }
+    status="degraded" means the agent works but some services are unavailable.
+    The agent uses graceful degradation for all non-critical services.
     """
-    return {"status": "ok", "agent": "ready"}
+    import asyncio as _asyncio
+
+    async def _probe_daemon():
+        try:
+            from orchestrator.modules._cli_client import ping
+            return "ok" if await ping() else "unreachable"
+        except Exception:
+            return "unreachable"
+
+    async def _probe_hea():
+        try:
+            from orchestrator.modules._hea_client import hea_ping
+            return "ok" if await hea_ping() else "unreachable"
+        except Exception:
+            return "unreachable"
+
+    async def _probe_chromadb():
+        try:
+            from orchestrator.rag.rag_service import get_rag_client
+            get_rag_client()
+            return "ok"
+        except Exception:
+            return "unreachable"
+
+    async def _probe_klayout():
+        try:
+            from orchestrator.drc.klayout_client import klayout_health_check
+            return "ok" if await klayout_health_check() else "unreachable"
+        except Exception:
+            return "unreachable"
+
+    daemon_s, hea_s, chroma_s, klayout_s = await _asyncio.gather(
+        _probe_daemon(), _probe_hea(), _probe_chromadb(), _probe_klayout(),
+        return_exceptions=True,
+    )
+
+    services = {
+        "eda_daemon":  str(daemon_s)  if not isinstance(daemon_s,  Exception) else "unreachable",
+        "hea":         str(hea_s)     if not isinstance(hea_s,     Exception) else "unreachable",
+        "chromadb":    str(chroma_s)  if not isinstance(chroma_s,  Exception) else "unreachable",
+        "klayout_drc": str(klayout_s) if not isinstance(klayout_s, Exception) else "unreachable",
+    }
+
+    all_ok = all(v == "ok" for v in services.values())
+    return {
+        "status":   "ok" if all_ok else "degraded",
+        "agent":    "ready",
+        "services": services,
+    }
 
 
 # ─── Main chat endpoint ───────────────────────────────────────────────────────
@@ -143,12 +206,18 @@ async def chat_endpoint(request: ChatRequest):
     """
     logger.info("[Server] Received: '%s'", request.message[:80])
 
+    from orchestrator.tracing import new_job_id
+    job_id = request.session_id or new_job_id()
+
     initial_state = {
-        "messages":       [HumanMessage(content=request.message)],
-        "active_intent":  "none",
-        "intent_params":  {},
+        "messages":        [HumanMessage(content=request.message)],
+        "active_intent":   "none",
+        "intent_params":   {
+            **({"layer_pref": request.layer_pref} if request.layer_pref else {}),
+        },
         "viewer_commands": [],
-        "layout_locked":  True,  # KLayout locked its UI while sending this request
+        "layout_locked":   True,
+        "job_id":          job_id,
     }
 
     try:

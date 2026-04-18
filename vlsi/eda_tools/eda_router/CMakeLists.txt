@@ -22,10 +22,13 @@ FetchContent_MakeAvailable(nlohmann_json)
 # All three are header-only — Boost::headers target covers them.
 find_package(Boost 1.80.0 REQUIRED)
 
-# ── Shared implementation units (DEF I/O + GridFill for GlobalPlanner linkage) ─
+# ── Shared implementation units (DEF I/O + GridFill + OASIS/Delta writers) ────
 add_library(routing_genetic_astar_io STATIC
     src/io/def_design_loader.cpp
     src/planner/grid_fill.cpp
+    src/oasis_writer.cpp           # [planned] OASIS streaming encoder
+    src/binary_delta_writer.cpp    # [planned] compact delta format for HEA Apply EU
+    src/via_expander.cpp           # [planned] two-stage via geometry expander
 )
 target_include_directories(routing_genetic_astar_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(routing_genetic_astar_io PUBLIC nlohmann_json::nlohmann_json Boost::headers)
@@ -33,6 +36,26 @@ target_compile_features(routing_genetic_astar_io PUBLIC cxx_std_23)
 
 # Renamed target alias (preferred by downstream projects).
 add_library(eda_router_io ALIAS routing_genetic_astar_io)
+
+# ── INTERFACE libraries: enforce 13-namespace dependency DAG at compile time ──
+# Each INTERFACE target restricts include paths to its own namespace only.
+# Violating the DAG produces a compile error rather than a linker surprise.
+foreach(mod core analysis threading planner routing constraints convergence eco evaluation)
+    add_library(rga_${mod} INTERFACE)
+    target_include_directories(rga_${mod} INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/routing_genetic_astar/${mod}>
+    )
+endforeach()
+
+# Encode the dependency DAG edges
+target_link_libraries(rga_analysis    INTERFACE rga_core)
+target_link_libraries(rga_threading   INTERFACE rga_core)
+target_link_libraries(rga_planner     INTERFACE rga_core rga_analysis)
+target_link_libraries(rga_routing     INTERFACE rga_core rga_analysis rga_planner rga_threading)
+target_link_libraries(rga_constraints INTERFACE rga_core rga_analysis rga_routing)
+target_link_libraries(rga_convergence INTERFACE rga_core rga_routing rga_threading)
+target_link_libraries(rga_eco         INTERFACE rga_core rga_routing rga_threading)
+target_link_libraries(rga_evaluation  INTERFACE rga_core rga_routing rga_constraints)
 
 # ── OR-Tools (optional — ILP fallback solver) ─────────────────────────────────
 find_package(ortools QUIET)

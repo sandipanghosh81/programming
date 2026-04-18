@@ -18,28 +18,35 @@ dependencies = [
     # ── Environment + config ──────────────────────────────────────────────────
     "python-dotenv>=1.0.0",
 
-    # ── WebSocket client (MCP calls from Python to the C++ EDA daemon) ───────
-    # All module subgraphs call the C++ daemon via WebSocket JSON-RPC.
-    # _cli_client.py uses this library.
+    # ── WebSocket client (MCP calls from Python to the C++ EDA daemon + HEA) ─
     "websockets>=12.0",
 
-    # ── Request validation (FastAPI uses Pydantic internally) ─────────────────
+    # ── HTTP client (DRC gate calls to KLayout service) ───────────────────────
+    "httpx>=0.27.0",
+
+    # ── Request validation ────────────────────────────────────────────────────
     "pydantic>=2.6.0",
 
-    # ── KLayout Python API (only needed when running inside KLayout) ──────────
-    # For development/testing outside KLayout, this is not needed.
-    # Comment out if you are running server.py standalone.
-    # "klayout>=0.29.0",
+    # ── EU template rendering ─────────────────────────────────────────────────
+    "jinja2>=3.1.0",
 ]
 
 [project.optional-dependencies]
 klayout = [
     "klayout>=0.29.0",
 ]
+rag = [
+    # RAG memory service — ChromaDB + sentence-transformers
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+]
+drc = [
+    # DRC support — httpx already in core; no extra deps beyond klayout
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
-    "httpx>=0.27.0",     # async HTTP test client for FastAPI
+    "httpx>=0.27.0",
 ]
 
 [build-system]

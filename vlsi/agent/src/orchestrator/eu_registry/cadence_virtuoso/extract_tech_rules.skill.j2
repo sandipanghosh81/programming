@@ -1,0 +1,44 @@
+;;; extract_tech_rules EU  —  Cadence Virtuoso / SKILL
+;;; Reads the live techfile and outputs a JSON file with geometric DRC rules.
+;;; ─────────────────────────────────────────────────────────────────────────
+;;; Jinja2 template variables:
+;;;   output_path   : string — where to write the JSON file (on /eda_share)
+;;;   layer_names   : list of string — layer names to extract (e.g. ["M1","M2"])
+
+let( (techObj rules layerInfo minWidth minSpace minArea jsonLines)
+  setq(techObj techGetTechFile(geGetWindowCellView()->lib))
+  unless(techObj error("extract_tech_rules: No techfile found"))
+
+  setq(jsonLines list("{ \"layers\": ["))
+
+  {% for layer in layer_names %}
+  setq(layerInfo techFindLayerByName(techObj "{{ layer }}"))
+  when(layerInfo
+    setq(minWidth techGetLayerParamValue(techObj "{{ layer }}" "minWidth") || 0)
+    setq(minSpace techGetLayerParamValue(techObj "{{ layer }}" "minSpace") || 0)
+    setq(minArea  techGetLayerParamValue(techObj "{{ layer }}" "minArea")  || 0)
+    setq(jsonLines append(jsonLines list(
+      sprintf(nil
+        "  {\"name\":\"%s\",\"layer\":%d,\"datatype\":0,\"min_width_um\":%.6f,\"min_space_um\":%.6f,\"min_area_um2\":%.9f}"
+        "{{ layer }}"
+        techGetLayerNumber(techObj "{{ layer }}")
+        minWidth minSpace minArea)
+    )))
+  )
+  {% endfor %}
+
+  ; Join with commas and close
+  setq(rules strcat(
+    "{\"layers\":["
+    buildString(cdr(jsonLines) ",\n")
+    "],\"via_rules\":[]}"
+  ))
+
+  let( (fp)
+    setq(fp outfile("{{ output_path }}" "w"))
+    fprintf(fp "%s\n" rules)
+    close(fp)
+  )
+  printf("extract_tech_rules: Written to {{ output_path }}\n")
+  "ok"
+)
