@@ -2,170 +2,413 @@
 
 > Single source of truth for the VLSI agent's architecture. For the C++ routing-engine internals, see [`implementation.md`](./implementation.md). For how to run the stack end-to-end, see [`chatbot_howto.md`](./chatbot_howto.md).
 
+## 1. Requirements and Capabilities
+
+This architecture fulfills the goal of orchestrating autonomous electronic design automation (EDA) workflows across **two cooperating tool layers** under a single LangGraph orchestrator.
+
+- **Internal Tool Layer** — production algorithms that run *inside* a proprietary EDA host (Cadence Virtuoso, Synopsys ICC2, KLayout). The orchestrator reaches them through a thin **Host Execution Agent (HEA)** embedded in the host process and dispatches self-contained **Execution Units (EUs)** that keep dense, iterative loops (DRC fixes, place-and-route convergence) inside host memory. No UI lockups, no per-iteration IPC.
+- **External Tool Layer** — the compiled C++ `eda_daemon` (with its `routing_genetic_astar`, `eda_placer`, DB reader, window automation libraries) and Python MCP tools (e.g., constraints parser). These run as separate processes and communicate over WebSocket JSON-RPC. This layer is the home of custom research algorithms and tool-neutral utilities.
+
+Several capabilities — notably the router and placer — are present in **both** layers. A host's production router is battle-tested on real silicon; a custom C++ router may explore a novel algorithm on the same netlist. The orchestrator treats these as peer implementations and picks between them according to an explicit routing policy.
+
+### Routing Policy
+
+1. **Default — Internal-first with analyze-then-augment.** The orchestrator dispatches to the internal (host) tool first. Results are analyzed, and the external (custom) tool is invoked only when the internal run fails, leaves open work, or the workflow explicitly wants a cross-check.
+2. **Explicit `internal_only`.** Skip the external layer entirely. The user is telling the agent "stay inside the host."
+3. **Explicit `external_only`.** Skip the internal layer entirely. Typical for custom-algorithm experiments or when the host is unavailable.
+
+This policy is the single source of truth for tool dispatch — see [§4 Tool Layers and Routing Policy](#4-tool-layers-and-routing-policy) for the state machine and [§10 Native Execution Units](#10-native-execution-units-eu-pattern) for the EU implementation.
+
 ## Table of contents
 
-1. [At a Glance](#1-at-a-glance)
-2. [Components](#2-components)
-3. [Request Flow](#3-request-flow)
-4. [Modules and Workflows](#4-modules-and-workflows)
-5. [Interfaces and Contracts](#5-interfaces-and-contracts)
-6. [Design Rules](#6-design-rules)
-7. [Running the Stack](#7-running-the-stack)
-8. [Future Direction (v3)](#8-future-direction-v3)
-9. [Appendices](#9-appendices)
+1. [Requirements and Capabilities](#1-requirements-and-capabilities)
+2. [At a Glance](#2-at-a-glance)
+3. [Components](#3-components)
+4. [Tool Layers and Routing Policy](#4-tool-layers-and-routing-policy)
+5. [Request Flow](#5-request-flow)
+6. [Modules and Workflows](#6-modules-and-workflows)
+7. [Interfaces and Contracts](#7-interfaces-and-contracts)
+8. [Design Rules](#8-design-rules)
+9. [Running the Stack](#9-running-the-stack)
+10. [Native Execution Units (EU Pattern)](#10-native-execution-units-eu-pattern)
+11. [Appendices](#11-appendices)
+12. [RAG Memory System](#12-rag-memory-system)
+13. [Docker Deployment](#13-docker-deployment)
 
 ---
 
-## 1. At a Glance
+## 2. At a Glance
 
-A user types a command into a KLayout dock panel. That request is routed through a Python LangGraph orchestrator which decides whether to answer directly or invoke an EDA module. Modules and workflows talk to a single C++ daemon over WebSocket JSON-RPC; the daemon hosts all algorithm code (router, placer, DB, window) in one process with a shared database.
+A user types a command into a KLayout dock panel (or equivalent dock inside Virtuoso / ICC2). The request is routed through a Python LangGraph orchestrator which decides whether to answer directly or invoke an EDA capability. When it invokes one, a **policy layer** selects between the **internal tool layer** (Execution Units running inside the host tool) and the **external tool layer** (the C++ `eda_daemon` reached over WebSocket JSON-RPC). By default the orchestrator tries internal first, analyzes the result, and escalates to external only when needed.
 
 ```mermaid
 flowchart LR
     User([User])
-    KL["KLayout dock<br/>chatbot_dock.py"]
-    API["FastAPI server<br/>:8000 /chat"]
-    G["LangGraph<br/>Orchestrator (Graph A)"]
-    D["eda_daemon<br/>:8080 WebSocket"]
+    Dock["Host dock\n(KLayout / Virtuoso / ICC2)"]
+    HEA["Host Execution Agent\n(in-host, EUs)"]
 
-    User --> KL
-    KL -- HTTP POST --> API
-    API --> G
-    G -- JSON-RPC --> D
+    subgraph DC["🐳 Docker Container"]
+        API["FastAPI :8000\n/chat"]
+        G["LangGraph\nOrchestrator"]
+        P{"Policy\nrouter\n+ RAG select"}
+        SS["Script Synthesis\n(RAG→LLM→REPL)"]
+        CDB[("ChromaDB\n:8001")]
+        D["eda_daemon\n:8080 WebSocket"]
+    end
+
+    User --> Dock
+    Dock -- "HTTP POST\n(host→container)" --> API
+    API --> G --> P
+    P -- "RAG tool\nselect" --> CDB
+    P -- "internal\n(script synthesis)" --> SS
+    SS --> CDB
+    SS -- "EU deploy" --> HEA
+    P -- "external / fallback" --> D
+    HEA --> G
     D --> G
-    G --> API
-    API --> KL
-    KL --> User
+    G --> API --> Dock --> User
 
     style G fill:#e67e22,color:#fff
+    style P fill:#f39c12,color:#fff
+    style SS fill:#e67e22,color:#fff
+    style HEA fill:#8e44ad,color:#fff
     style D fill:#2ecc71,color:#fff
-    style KL fill:#4a90d9,color:#fff
+    style Dock fill:#4a90d9,color:#fff
+    style CDB fill:#1a6b9a,color:#fff
+    style DC fill:#0d2137,color:#ccc,stroke:#3498db,stroke-width:2px
 ```
 
-**Three processes, one shared language (JSON).** The KLayout macro, the agent server, and the C++ daemon each run independently and can be restarted without bringing the others down.
+**Containerised agent, host-native execution.** Everything except the EDA host and its HEA runs inside a single Docker container that ships with the tool installation. The host dock reaches into the container on port 8000; the container reaches back into the host on port 18082 to deploy EUs. The C++ daemon, ChromaDB, and (optionally) Ollama are all co-located in the container. Any of the services can be restarted without bringing the others down.
 
 ---
 
-## 2. Components
+## 3. Components
 
-Four cooperating pieces. Read this table first; drill into later sections only for the piece you're changing.
+The stack is organized into an **orchestration plane** (host-agnostic) and two **tool layers** (host-specific and custom). Read this table first; drill into later sections only for the piece you're changing.
+
+### 3.1 Orchestration plane
 
 | Component | Process / Port | File(s) | Responsibility |
 |---|---|---|---|
-| **KLayout Chatbot** | KLayout (PyQt dock) | `vlsi/agent/klayout_macro/chatbot_dock.py` | Capture user text, show replies, render `viewer_commands` on the canvas |
+| **Host Chatbot Dock** | Host (PyQt / Tk / native) | `vlsi/agent/klayout_macro/chatbot_dock.py` (+ Virtuoso/ICC2 equivalents) | Capture user text, show replies, render `viewer_commands` on the canvas |
 | **Agent Server** | Python / FastAPI · `:8000` | `vlsi/agent/server.py` | HTTP entry point; owns one compiled LangGraph instance |
-| **Orchestrator (Graph A)** | Inside agent server | `vlsi/agent/src/orchestrator/orchestrator_graph.py` | LLM intent parsing, dispatch to modules or workflows |
+| **Orchestrator (Graph A)** | Inside agent server | `vlsi/agent/src/orchestrator/orchestrator_graph.py` | LLM intent parsing, policy-driven layer selection, dispatch to modules or workflows |
+| **Policy Router** | Inside Graph A | `vlsi/agent/src/orchestrator/policy/layer_router.py` | Applies the internal-first routing policy; honors `internal_only` / `external_only` overrides |
+| **EU Compiler Node** | Inside Graph A | `vlsi/agent/src/orchestrator/eu_compiler.py` | Renders Jinja2 templates, validates syntax, packages EUs for the HEA |
+
+### 3.2 External tool layer (custom, separate process)
+
+| Component | Process / Port | File(s) | Responsibility |
+|---|---|---|---|
 | **C++ Daemon** | Native binary · `:8080` (WS) | `vlsi/eda_tools/eda_cli/` | JSON-RPC gateway; router / placer / DB / window all linked in one process sharing a `SharedDatabase` |
+| **Constraints MCP tool** | Python MCP · `:18081` | `vlsi/eda_tools/python/constraints_tool/` | Parses SPICE into a tool-neutral `analog_problem`; used by the placer path |
+
+### 3.3 Internal tool layer (host-embedded, EU pattern)
+
+| Component | Process | File(s) | Responsibility |
+|---|---|---|---|
+| **Host Execution Agent (HEA)** | Embedded inside the EDA host (Virtuoso / ICC2 / KLayout) | `vlsi/agent/src/hea/` (hosts each ship their own loader script) | Minimal MCP server exposing `deploy_eu`, `query_state`, `write_state`, `stream_log`. Defers execution to the host's idle callback so UI threads never deadlock. |
+| **Shared State Store** | In-host key-value dict | part of HEA | Carries inputs/outputs between EUs without round-tripping to LangGraph |
+| **Window / DB Adapters** | In-host | part of HEA | Resolve generic ops (`zoom_to_bbox`, `get_cellview`) to host-specific APIs (`hiZoomIn`, `gui_start_wait_cursor`, `pya.LayoutView`) |
+| **EU Registry** | On disk, external | `vlsi/agent/src/orchestrator/eu_registry/{cadence_virtuoso,synopsys_icc2,klayout}/` | Jinja2 templates of validated, reusable EU scripts |
+
+### 3.4 RAG memory system
+
+| Component | Process / Port | File(s) | Responsibility |
+|---|---|---|---|
+| **RAG Service** | Inside agent process | `vlsi/agent/src/rag/rag_service.py` | Retrieves vendor API doc chunks relevant to a capability or query; used by policy router (tool selection) and script synthesis (API context) |
+| **ChromaDB** | Sidecar container · `:8001` | `docker/chromadb/` | Persistent vector store; one collection per EDA tool × software version (e.g., `virtuoso_icadvm_23_1`) |
+| **RAG Ingestor** | One-shot CLI / scheduled | `vlsi/agent/src/rag/ingestor.py` | Chunks and embeds vendor docs on first install; re-indexes when EDA version is updated |
+
+### 3.5 Script synthesis and Python REPL
+
+| Component | Process / Port | File(s) | Responsibility |
+|---|---|---|---|
+| **Script Synthesis Node** | Inside Graph A | `vlsi/agent/src/orchestrator/script_synthesis.py` | RAG retrieval → LLM synthesis → REPL dry-run → static validation pipeline; produces a ready-to-deploy EU when the registry has no matching template |
+| **Python REPL (sandbox)** | Subprocess inside container | `vlsi/agent/src/orchestrator/python_repl.py` | Executes KLayout-Python EUs in an isolated `subprocess` before they are deployed to the HEA. For SKILL / Tcl EUs syntax-only validation is used (no native interpreter in Docker). |
 
 Two auxiliary pieces extend the flow without adding processes:
 
-- **Constraints MCP tool** (`:18081`) — Python MCP server parsing SPICE into a tool-neutral `analog_problem`; used by the placer path.
-- **Module subgraphs and workflows** — internal LangGraph nodes (`m1`…`m4`, `w1`, `w2`) that compose simple and multi-step EDA tasks.
+- **Module subgraphs and workflows** — internal LangGraph nodes (`m1`…`m4`, `w1`, `w2`) that compose simple and multi-step EDA tasks. Each module now supports both layers; see [§6 Modules and Workflows](#6-modules-and-workflows).
+- **Constraints MCP tool** — as listed above, shared across both layers.
 
 ```mermaid
 graph TB
-    subgraph KLayout["KLayout process"]
-        dock["chatbot_dock.py<br/>PyQt dock widget"]
-    end
-
-    subgraph AgentSvc["Agent server (Python)"]
-        api[":8000 FastAPI<br/>server.py"]
-        subgraph GraphA["LangGraph Orchestrator — Graph A"]
-            intent["parse_intent"]
-            dispatch{"dispatch"}
-            modules["m1 router<br/>m2 placer<br/>m3 db<br/>m4 window"]
-            workflows["w1 full route<br/>w2 drc fix loop"]
-            chat["chat_node"]
-            outputs["collect_outputs"]
+    subgraph HostProc["Host process (KLayout / Virtuoso / ICC2)  ── on host OS"]
+        dock["chatbot_dock (PyQt/Tk)<br/>or native dock"]
+        subgraph HEA_box["Host Execution Agent (HEA)"]
+            heaSvc["MCP server<br/>deploy_eu / query_state<br/>write_state / stream_log"]
+            stateStore[("Shared State Store<br/>in-host KV dict")]
+            adapters["Window + DB Adapters"]
         end
     end
 
-    subgraph CppDaemon["C++ daemon process"]
-        dispatcher[":8080 eda_daemon.cpp<br/>JSON-RPC dispatcher"]
-        shared[("SharedDatabase<br/>in-process")]
-        router["Router library"]
-        placer["Placer library"]
-        dbserver["DB reader"]
-        winauto["Window automation"]
-        dispatcher --> router & placer & dbserver & winauto
-        router & placer & dbserver & winauto --- shared
+    subgraph DockerContainer["🐳 Docker Container (ships with tool)"]
+        subgraph AgentSvc["Agent service  :8000"]
+            api["FastAPI  server.py"]
+            subgraph GraphA["LangGraph Orchestrator — Graph A"]
+                intent["parse_intent"]
+                policy{"layer_router<br/>(internal-first +<br/>RAG tool select)"}
+                synth["Script Synthesis<br/>RAG → LLM → REPL"]
+                repl["Python REPL<br/>(sandbox dry-run)"]
+                euc["eu_compiler"]
+                modules["m1 router · m2 placer<br/>m3 db · m4 window"]
+                workflows["w1 full_route<br/>w2 drc_fix_loop"]
+                chat["chat_node"]
+                outputs["collect_outputs"]
+            end
+            ragSvc["RAG Service<br/>rag_service.py"]
+        end
+
+        subgraph CppDaemon["eda_daemon service  :8080"]
+            dispatcher["JSON-RPC dispatcher"]
+            shared[("SharedDatabase")]
+            router["Router library"]
+            placer["Placer library"]
+            dbserver["DB reader"]
+            winauto["Window automation"]
+            dispatcher --> router & placer & dbserver & winauto
+            router & placer & dbserver & winauto --- shared
+        end
+
+        subgraph ChromaSvc["ChromaDB service  :8001"]
+            chromadb[("Vector store<br/>per-tool collections")]
+        end
+
+        subgraph Constraints["Constraints MCP  :18081"]
+            cmcp["constraints.extract"]
+        end
     end
 
-    subgraph Constraints["Constraints MCP (optional)"]
-        cmcp[":18081 MCP server<br/>constraints.extract"]
-    end
-
-    dock -- HTTP /chat --> api
-    api --> intent --> dispatch
-    dispatch --> modules
-    dispatch --> workflows
-    dispatch --> chat
+    dock -- "HTTP /chat  (host→container)" --> api
+    api --> intent --> policy
+    policy -- "RAG tool select" --> ragSvc
+    ragSvc <--> chromadb
+    policy -- internal --> synth
+    synth --> ragSvc
+    synth --> repl
+    synth --> euc
+    policy -- external --> modules
+    policy -- full flow --> workflows
+    policy --> chat
     outputs --> api
 
+    euc -- deploy_eu --> heaSvc
+    heaSvc -.-> stateStore
+    heaSvc -.-> adapters
     modules -- ws JSON-RPC --> dispatcher
     workflows -- ws JSON-RPC --> dispatcher
+    workflows -- deploy_eu --> heaSvc
     modules -. SPICE .-> cmcp
 
     api -- viewer_commands --> dock
 
     style dock fill:#4a90d9,color:#fff
     style GraphA fill:#2a1a3e,color:#fff
+    style policy fill:#f39c12,color:#fff
+    style synth fill:#e67e22,color:#fff
+    style repl fill:#e67e22,color:#fff
+    style euc fill:#f39c12,color:#fff
     style dispatcher fill:#2ecc71,color:#fff
     style shared fill:#27ae60,color:#fff
+    style heaSvc fill:#8e44ad,color:#fff
+    style stateStore fill:#6c3483,color:#fff
+    style adapters fill:#6c3483,color:#fff
     style cmcp fill:#9b59b6,color:#fff
+    style ragSvc fill:#1a6b9a,color:#fff
+    style chromadb fill:#1a6b9a,color:#fff
+    style DockerContainer fill:#0d2137,color:#ccc,stroke:#3498db,stroke-width:2px
 ```
 
 ---
 
-## 3. Request Flow
+## 4. Tool Layers and Routing Policy
 
-A single chat turn, end-to-end. Later sections expand each hop.
+Graph A sees the world as **capabilities** (route nets, place cells, query DB, automate window, run a full flow). Every capability can be served by at least one layer; several are served by both. The policy layer — `layer_router` — is what turns a parsed intent into a concrete layer selection.
+
+### 4.1 Capability matrix
+
+| Capability | Internal (HEA / EU) | External (C++ daemon) | Default policy |
+|---|---|---|---|
+| Route nets (`route_nets`) | ✓ Host router via EU (`route_nets.skill.j2`, `route_nets.tcl.j2`) | ✓ `routing_genetic_astar` | Internal-first, external as cross-check or fallback |
+| Place cells (`place_cells`) | ✓ Host placer via EU | ✓ `eda_placer` (+ constraints MCP) | Internal-first, external for custom analog flows or when SPICE path is requested |
+| DB queries (`db.*`) | ✓ Direct host DB via EU | ✓ DB reader | Internal-first (host DB is authoritative) |
+| Window automation (`view.*`) | ✓ Host native UI via EU + Window Adapter | ✓ KLayout-only via viewer commands | Always **internal** if the user is in a proprietary host; external for KLayout dock |
+| Full P&R (`w1`) | ✓ Host-native EU sequence | ✓ External module chain | Internal-first; external allowed as augmentation step |
+| DRC fix loop (`w2`) | ✓ Tight in-host EU loop (preferred — zero IPC per iteration) | ✓ External module chain | Strongly internal-first; the in-host loop is the whole point of the EU pattern |
+| Constraints extraction | — | ✓ Constraints MCP (`:18081`) | External only (tool-neutral by design) |
+
+### 4.2 Routing policy state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> ParseIntent
+    ParseIntent --> ReadOverride: capability + user pref
+    ReadOverride --> InternalOnly: "use only internal" / host-only tool
+    ReadOverride --> ExternalOnly: "use only external" / external-only tool
+    ReadOverride --> DefaultPolicy: no override
+
+    DefaultPolicy --> TryInternal: capability has internal impl
+    DefaultPolicy --> TryExternal: capability has no internal impl
+
+    InternalOnly --> TryInternal
+    TryInternal --> Analyze: EU completes
+    TryInternal --> ExternalFallback: EU fails AND not internal_only
+    TryInternal --> ReportError: EU fails AND internal_only
+
+    Analyze --> Done: success, no augmentation requested
+    Analyze --> TryExternalAugment: workflow requests cross-check
+
+    TryExternalAugment --> Done
+    ExternalFallback --> TryExternal
+    ExternalOnly --> TryExternal
+    TryExternal --> Done
+
+    Done --> [*]
+    ReportError --> [*]
+```
+
+### 4.3 How the policy is expressed
+
+Every module subgraph (m1…m4) and workflow (w1, w2) accepts a `layer_pref` field in its input state:
+
+```python
+class LayerPref(Enum):
+    AUTO          = "auto"            # default: internal-first, analyze, escalate
+    INTERNAL_ONLY = "internal_only"   # no external fallback
+    EXTERNAL_ONLY = "external_only"   # skip internal entirely
+    BOTH          = "both"            # run both, return combined result
+```
+
+The policy router reads `layer_pref` off the parsed intent:
+
+- If the user's message contains phrases like *"use only custom"*, *"ignore the host"*, *"external-only"* → `EXTERNAL_ONLY`
+- If the user says *"stay inside Virtuoso"*, *"host-only"*, *"don't use the custom engine"* → `INTERNAL_ONLY`
+- If the user says *"cross-check with both"*, *"run it both ways"* → `BOTH`
+- Otherwise → `AUTO`
+
+The LLM node `parse_intent` extracts this preference as a typed field on state; no tool call examines the raw message for intent.
+
+### 4.4 Analyze-then-augment
+
+In `AUTO` mode, after the internal EU completes, an `analyze_internal_result` node decides whether to augment with the external layer. Typical augmentation triggers:
+
+- Internal DRC-clean but wirelength significantly above a threshold → try external router for comparison
+- Internal route failed on N specific nets → hand those nets to external router, merge results
+- Internal placer gave a legal placement but user explicitly requested the SPICE-driven analog path → run external placer with constraints MCP, compare QoR
+
+Augmentation is **opt-in per workflow**. `w1_full_route_flow` turns it on by default; `m1`/`m2` single-tool calls leave it off unless the intent explicitly asks for a cross-check.
+
+---
+
+## 5. Request Flow
+
+A single chat turn, end-to-end, showing both the internal and external paths. Later sections expand each hop.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as User
-    participant K as KLayout dock
+    participant Dock as Host dock
     participant S as FastAPI /chat
     participant G as Graph A
+    participant P as layer_router
+    participant RAG as RAG Service
+    participant CDB as ChromaDB
+    participant SS as Script Synthesis
+    participant REPL as Python REPL
+    participant EUC as eu_compiler
+    participant HEA as HEA (in-host)
     participant M as Module / Workflow
     participant D as eda_daemon
 
-    U->>K: Types command
-    K->>S: POST {"message": "..."}
+    U->>Dock: Types command
+    Dock->>S: POST {"message": "..."}
     S->>G: master_graph.ainvoke(state)
-    G->>G: parse_intent (LLM)
-    G->>M: dispatch_intent → m1/m2/m3/m4 or w1/w2
-    M->>D: JSON-RPC (load_design, place_cells, ...)
-    D-->>M: result payload
-    M-->>G: {reply, viewer_commands}
+    G->>G: parse_intent (LLM) → {capability, layer_pref}
+    G->>P: route(capability, layer_pref)
+
+    Note over P,CDB: RAG-assisted tool selection
+    P->>RAG: query(capability, design_context)
+    RAG->>CDB: vector_search(embedding)
+    CDB-->>RAG: top-k API doc chunks
+    RAG-->>P: tool_recommendation + context
+
+    alt Internal path (AUTO / INTERNAL_ONLY)
+        P->>EUC: compile_eu(capability, params)
+        EUC->>EUC: registry lookup → Jinja2 render
+
+        opt No registry template found
+            Note over EUC,REPL: Script Synthesis pipeline
+            EUC->>SS: synthesize(capability, params)
+            SS->>RAG: retrieve_api_docs(capability, host)
+            RAG->>CDB: vector_search(embedding)
+            CDB-->>RAG: API doc chunks
+            RAG-->>SS: api_context
+            SS->>SS: LLM synthesis with api_context
+            SS->>REPL: dry_run(python_eu_code)
+            REPL-->>SS: {ok, stdout, error}
+            SS->>SS: static_validate(skill/tcl/python)
+            SS-->>EUC: validated_eu_code
+        end
+
+        EUC->>HEA: deploy_eu(eu_id, code, timeout_s)
+        HEA->>HEA: defer to host idle callback
+        HEA-->>EUC: {status, output_keys, wall_time_s}
+        EUC->>HEA: query_state(output_keys)
+        HEA-->>EUC: {output.* values}
+        EUC-->>P: internal_result
+        P->>P: analyze_internal_result
+
+        opt AUTO + augmentation triggered
+            P->>M: dispatch_external(capability, params)
+            M->>D: JSON-RPC
+            D-->>M: result
+            M-->>P: external_result
+        end
+    else External path (EXTERNAL_ONLY)
+        P->>M: dispatch_external(capability, params)
+        M->>D: JSON-RPC (load_design, place_cells, ...)
+        D-->>M: result payload
+        M-->>P: external_result
+    end
+
+    P-->>G: {reply, viewer_commands}
     G->>G: collect_outputs (unlock_ui)
     G-->>S: final state
-    S-->>K: JSON response
-    K->>K: _process_viewer_commands(...)
-    K-->>U: Reply + canvas update
+    S-->>Dock: JSON response
+    Dock->>Dock: _process_viewer_commands(...)
+    Dock-->>U: Reply + canvas update
 ```
 
-**Reading the flow.** The only LLM call in the hot path is `parse_intent` (step 4). Everything else is deterministic routing and tool invocation. This keeps latency predictable and debugging tractable.
+**Reading the flow.** The hot path has two LLM calls: `parse_intent` (step 4) and — when no registry template exists — the script synthesis call inside `Script Synthesis`. RAG retrieval is a fast vector search against the local ChromaDB (in-container) and adds no external network round-trips. The Python REPL dry-run (step 17) only runs for KLayout-Python EUs; SKILL and Tcl EUs get static syntax validation only. Everything else is deterministic routing and tool invocation.
 
 ---
 
-## 4. Modules and Workflows
+## 6. Modules and Workflows
 
 Two kinds of children under Graph A:
 
-- **Modules** (`m1…m4`) — single-tool wrappers. They validate input, make one call to the daemon, format a response. Use them for "do one thing" intents.
-- **Workflows** (`w1`, `w2`) — multi-step pipelines that may call several modules internally and iterate. Use them when the user asks for a compound outcome (full P&R, DRC fix loop).
+- **Modules** (`m1…m4`) — single-capability wrappers. Each module now has **two execution paths**: an internal path that deploys an EU to the HEA, and an external path that calls the C++ daemon. The module's job is to validate input, honor `layer_pref`, invoke the appropriate path(s), and format a unified response.
+- **Workflows** (`w1`, `w2`) — multi-step pipelines that may call several modules internally and iterate. Workflows are where the analyze-then-augment policy lives; they can run all iterations in-host (preferred for tight loops) or interleave with external calls.
 
 ```mermaid
 graph TD
-    A["Graph A<br/>dispatch_intent"] -->|route| M1["m1 router"]
-    A -->|place| M2["m2 placer"]
-    A -->|db_query| M3["m3 db"]
-    A -->|view| M4["m4 window"]
+    A["Graph A<br/>dispatch_intent"] -->|route| M1["m1 router<br/>(internal + external)"]
+    A -->|place| M2["m2 placer<br/>(internal + external)"]
+    A -->|db_query| M3["m3 db<br/>(internal + external)"]
+    A -->|view| M4["m4 window<br/>(internal + external)"]
     A -->|full flow| W1["w1 full_route_flow"]
     A -->|drc fix| W2["w2 drc_fix_loop"]
     A -->|general| C["chat_node"]
+
+    M1 -. internal .-> HEA["HEA (EU)"]
+    M1 -. external .-> D["eda_daemon"]
+    M2 -. internal .-> HEA
+    M2 -. external .-> D
+    M3 -. internal .-> HEA
+    M3 -. external .-> D
+    M4 -. internal .-> HEA
 
     W1 -. uses .-> M2
     W1 -. uses .-> M1
@@ -176,19 +419,40 @@ graph TD
     style A fill:#e67e22,color:#fff
     style W1 fill:#f39c12,color:#fff
     style W2 fill:#f39c12,color:#fff
+    style HEA fill:#8e44ad,color:#fff
+    style D fill:#2ecc71,color:#fff
 ```
+
+### 6.1 Dual-path module structure
+
+Each module subgraph follows the same four-node shape:
+
+```
+validate_input → route_by_layer_pref ─┬── internal_branch ──┐
+                                      │   (eu_compiler +    ├── merge_and_format
+                                      │    HEA dispatch)    │
+                                      └── external_branch ──┘
+                                          (C++ daemon
+                                           JSON-RPC)
+```
+
+`route_by_layer_pref` is not an LLM call — it's a pure function that reads `layer_pref` from state and picks which branch(es) to execute. In `AUTO` mode it runs the internal branch first, inspects the result, and conditionally invokes the external branch.
 
 <details>
 <summary><b>m2 — Placer subgraph (detail)</b></summary>
 
 File: `vlsi/agent/src/orchestrator/modules/m2_placer_subgraph.py`
 
-Nodes, in order:
+**Nodes (dual-path):**
 
-1. `validate_placement_input` — checks daemon reachability.
-2. `call_placer_via_cli` — invokes placement via MCP. If `placement_params.spice_netlist_path` is set, builds an `analog_problem` via the **constraints MCP tool** (preferred) or the local fallback in `utils/spice_to_analog_problem.py`.
-3. `format_placer_response` — returns the user-facing message plus viewer commands:
-   - `draw_instances` on layer `999/0`
+1. `validate_placement_input` — checks daemon reachability *and* HEA handshake (whichever layer the policy will touch).
+2. `route_by_layer_pref` — reads `layer_pref` and fans out.
+3. `internal_branch.compile_eu` — renders `eu_registry/<host>/place_cells.{skill,tcl,py}.j2` with `cell_name`, `region_bbox`, and `constraints_handle`.
+4. `internal_branch.deploy_eu` — sends the EU over MCP, receives final `output.placement_handle` plus QoR summary.
+5. `external_branch.call_placer_via_cli` — invokes placement via MCP. If `placement_params.spice_netlist_path` is set, builds an `analog_problem` via the **constraints MCP tool** (preferred) or the local fallback in `utils/spice_to_analog_problem.py`.
+6. `analyze_internal_result` — in `AUTO` mode, compares internal placement QoR against augmentation thresholds; decides whether to also run external.
+7. `format_placer_response` — returns the user-facing message plus viewer commands:
+   - `draw_instances` on layer `999/0` (from whichever layer produced the placement)
    - `draw_routes` on layer `998/0` (early-route visualization, built by `utils/early_router.build_early_routes`)
 
 </details>
@@ -198,25 +462,25 @@ Nodes, in order:
 
 File: `vlsi/agent/src/orchestrator/modules/m1_router_subgraph.py`
 
-Nodes: `validate_routing_input` → `call_router_via_cli` → `format_router_response`.
+Nodes: `validate_routing_input` → `route_by_layer_pref` → {`internal: compile_eu → deploy_eu`, `external: call_router_via_cli`} → `analyze_internal_result` → `format_router_response`.
 
-Uses the shared `_cli_client.mcp_call(method, params)` over WebSocket to the daemon (`ws://127.0.0.1:8080`).
+The internal branch uses `eu_registry/<host>/route_nets.{skill,tcl,py}.j2`. The external branch uses the shared `_cli_client.mcp_call(method, params)` over WebSocket to the daemon (`ws://127.0.0.1:8080`).
 
 </details>
 
 <details>
 <summary><b>m3 / m4 — DB and Window subgraphs</b></summary>
 
-- `m3_db_subgraph.py` — status queries, net lists, bounding boxes. Calls DB-side MCP methods.
-- `m4_window_subgraph.py` — emits viewer commands (`zoom_to`, `refresh_view`, `screenshot`, ...). These are serialized back to the KLayout dock which executes them on the canvas.
+- `m3_db_subgraph.py` — status queries, net lists, bounding boxes. Internal path reads directly from host DB via EU (authoritative source when working in a proprietary host). External path calls DB-side MCP methods on the daemon.
+- `m4_window_subgraph.py` — internal path runs EUs that call the host's native window APIs (via the Window Adapter). External path emits viewer commands (`zoom_to`, `refresh_view`, `screenshot`, ...) for the KLayout dock. For proprietary hosts, the internal path is always used.
 
 </details>
 
 <details>
 <summary><b>w1 / w2 — Workflows</b></summary>
 
-- `w1_full_route_flow.py` — orchestrates placer → router → window refresh for a full P&R turn.
-- `w2_drc_fix_loop.py` — iterative DRC correction. Queries violations via `m3`, re-routes offenders via `m1`, repeats until clean or retry budget is exhausted.
+- `w1_full_route_flow.py` — orchestrates placer → router → window refresh for a full P&R turn. Supports `AUTO`, `INTERNAL_ONLY`, `EXTERNAL_ONLY`, and `BOTH` layer preferences. In `AUTO`, runs placement internally, analyzes QoR, then routes internally; can augment with an external router cross-check when requested.
+- `w2_drc_fix_loop.py` — iterative DRC correction. The whole loop body (query violations → re-route offenders → re-check) is packaged as **a single EU** when the internal layer is available. This is the canonical example of why the EU pattern exists: thousands of inner iterations with zero IPC round-trips. External fallback exists for KLayout or when the host doesn't expose the needed DRC API.
 
 Workflows expose only `start` / `finished` edges to Graph A — Graph A never sees their internal iteration.
 
@@ -224,25 +488,26 @@ Workflows expose only `start` / `finished` edges to Graph A — Graph A never se
 
 ---
 
-## 5. Interfaces and Contracts
+## 7. Interfaces and Contracts
 
-Three boundaries — each one is a narrow, auditable contract.
+Four boundaries — each one is a narrow, auditable contract.
 
-### 5.1 Dock ↔ Agent server (HTTP)
+### 7.1 Dock ↔ Agent server (HTTP)
 
 ```
 POST http://127.0.0.1:8000/chat
 Content-Type: application/json
 
-Request:  {"message": "<user text>"}
-Response: {"reply": "<text>", "viewer_commands": [ {...}, ... ]}
+Request:  {"message": "<user text>", "layer_pref": "auto"}
+Response: {"reply": "<text>", "viewer_commands": [ {...}, ... ],
+           "layer_used": "internal" | "external" | "both"}
 ```
 
-`viewer_commands` is the only way the agent changes the canvas. The dock's `_process_viewer_commands(commands)` implements actions such as `draw_instances`, `draw_routes`, `zoom_fit`, `refresh_view`, `screenshot`.
+`viewer_commands` is the only way the agent changes the canvas of the KLayout dock. The dock's `_process_viewer_commands(commands)` implements actions such as `draw_instances`, `draw_routes`, `zoom_fit`, `refresh_view`, `screenshot`. For proprietary hosts the equivalent canvas changes happen in-host as a side-effect of the EU; `viewer_commands` is then used only for any external overlays the orchestrator needs to draw.
 
-### 5.2 Agent ↔ C++ daemon (WebSocket JSON-RPC)
+### 7.2 Agent ↔ C++ daemon (WebSocket JSON-RPC) — external layer
 
-All module and workflow code calls `mcp_call(method, params)` in `modules/_cli_client.py`. Representative methods:
+All external-path module and workflow code calls `mcp_call(method, params)` in `modules/_cli_client.py`. Representative methods:
 
 | Method | Owner inside daemon |
 |---|---|
@@ -252,33 +517,71 @@ All module and workflow code calls `mcp_call(method, params)` in `modules/_cli_c
 | `place_cells` | Placer server |
 | `view.zoom_to`, `view.refresh` | Window server |
 
-### 5.3 Agent ↔ Constraints MCP (optional, SPICE path)
+### 7.3 Agent ↔ HEA (MCP over WebSocket) — internal layer
+
+The HEA exposes exactly four MCP tools. This minimal surface is deliberate — the HEA is a queue, not a graph runtime. All graph logic stays in LangGraph.
+
+| MCP tool | Purpose |
+|---|---|
+| `deploy_eu(eu_id, language, code, timeout_s, stream)` | Enqueue and execute an EU on the host's main thread via idle callback |
+| `query_state(keys)` | Read values from the in-host state store |
+| `write_state(kv)` | Seed inputs into the state store before an EU runs |
+| `stream_log(eu_id)` | Server-streamed log lines for a running EU |
+
+**`deploy_eu` request/response contract:**
+
+```json
+// Request
+{
+  "eu_id": "eu_place_drc_001",
+  "language": "skill",           // "skill" | "tcl" | "klayout_python"
+  "code": "<fully rendered, validated script>",
+  "timeout_s": 120,
+  "stream": true
+}
+
+// Response (sync, after EU completes or times out)
+{
+  "eu_id": "eu_place_drc_001",
+  "status": "success",           // "success" | "error" | "timeout"
+  "output_keys": ["output.iter_count", "output.drc_passed"],
+  "error_detail": null,
+  "wall_time_s": 4.3
+}
+```
+
+The `output_keys` field tells the orchestrator exactly which state-store keys the EU wrote, so `query_state()` never has to guess. See [§10](#10-native-execution-units-eu-pattern) for the state-store preamble/epilogue convention that guarantees this.
+
+### 7.4 Agent ↔ Constraints MCP (optional, SPICE path)
 
 - **Server** `vlsi/eda_tools/python/constraints_tool/mcp_server.py` exposes `constraints.extract`.
-- **Client** `vlsi/agent/src/orchestrator/utils/constraints_mcp_client.py` is called by `m2` when a SPICE netlist is provided.
+- **Client** `vlsi/agent/src/orchestrator/utils/constraints_mcp_client.py` is called by `m2` when a SPICE netlist is provided — on either the internal or external branch.
 
 ---
 
-## 6. Design Rules
+## 8. Design Rules
 
-Four anti-coupling guarantees the code base enforces:
+Six anti-coupling guarantees the code base enforces:
 
-1. **No Python module calls another Python module directly.** `m1` never imports from `m2`. Cross-module communication goes through Graph A or through the C++ daemon's JSON-RPC interface.
+1. **No Python module calls another Python module directly.** `m1` never imports from `m2`. Cross-module communication goes through Graph A or through a tool-layer contract (daemon JSON-RPC or HEA MCP).
 2. **No C++ module calls another C++ module through Python.** Router/Placer/DB all share one process memory via `SharedDatabase`. Inter-module calls are direct C++ function calls inside the daemon binary — never a round-trip through Python.
 3. **`eda_cli` is the gateway, not an algorithm.** Algorithm modules (e.g. `routing_genetic_astar`, `eda_placer`) are compiled as libraries and linked into the daemon.
 4. **Workflows own their iteration logic.** `w1`, `w2` use module subgraphs internally but expose only `start` / `finished` to Graph A.
+5. **The HEA is not a graph runtime.** Its only job is to receive EUs, execute them on the host's main thread, and expose the state store. All orchestration logic — sequencing, conditionals, retries, analyze-then-augment — lives in LangGraph. No SKILL/Tcl graph DSL, no duplicate orchestrator.
+6. **Layer selection is policy, not code.** Modules do not hard-code a layer. The policy router reads `layer_pref` off state and drives the branch selection; adding a new layer (or a new internal host) does not require touching the module bodies.
 
 ---
 
-## 7. Running the Stack
+## 9. Running the Stack
 
-Three terminals, three ports. See [`chatbot_howto.md`](./chatbot_howto.md) for the full guide including troubleshooting.
+Four ports in the full configuration. See [`chatbot_howto.md`](./chatbot_howto.md) for the full guide including troubleshooting.
 
 ```mermaid
 sequenceDiagram
     participant T1 as Terminal A
     participant T2 as Terminal B
     participant T3 as KLayout
+    participant T4 as Host (Virtuoso/ICC2)
     Note over T1: cd vlsi && make daemon
     T1->>T1: Starts eda_daemon (:8080)<br/>+ constraints MCP (:18081)<br/>+ server.py (:8000)
     Note over T2: Optional health check
@@ -287,202 +590,465 @@ sequenceDiagram
     Note over T3: Import & run macro<br/>klayout_macro/chatbot_dock.py
     T3->>T1: POST /chat {"message":"hello"}
     T1-->>T3: {"reply":"...","viewer_commands":[]}
+    Note over T4: load HEA loader<br/>(SKILL/Tcl/Python plugin)
+    T4->>T4: HEA listening on :18082 (WS)
+    T1->>T4: deploy_eu (when internal layer used)
+    T4-->>T1: {status, output_keys, ...}
 ```
 
 | Port | Process | Purpose |
 |---|---|---|
 | `:8000` | Python `server.py` | HTTP `/chat` |
-| `:8080` | C++ `eda_daemon` | WebSocket JSON-RPC |
+| `:8080` | C++ `eda_daemon` | WebSocket JSON-RPC (external layer) |
 | `:18081` | Python `constraints_tool` MCP | SPICE parsing (optional) |
+| `:18082` | HEA (embedded in host) | MCP for internal layer (only when a proprietary host is running) |
+
+**The internal layer is optional.** If no HEA is reachable, the orchestrator downgrades `AUTO` to `EXTERNAL_ONLY` automatically and emits a log line. The existing KLayout-plus-daemon workflow keeps working unchanged.
 
 ---
 
-## 8. Future Direction (v3)
+## 10. Native Execution Units (EU Pattern)
 
-This section describes the **target architecture** — a distributed mini-orchestrator model where each MCP server has its own LangGraph sub-graph and can query peers before invoking the underlying C++ engine. The current system (above) is a stepping-stone toward this.
+The **Execution Unit** pattern is the internal tool layer's runtime model. It lets the external LangGraph orchestrator drive work inside a proprietary EDA host (Cadence Virtuoso, Synopsys ICC2, KLayout) **without duplicating the graph runtime inside the host** (the "Dual-Graph" anti-pattern, rejected during design review).
 
-### 8.1 Model in One Picture
+The single orchestrator reaches into the host via one mechanism — deploying a compiled, self-contained script (an EU) to a thin Host Execution Agent. Tight inner loops (DRC fix iterations, place-and-route convergence) run entirely in host memory, bypassing IPC on every iteration. The orchestrator only sees the final state when the EU completes.
+
+### 10.1 Pattern overview
 
 ```mermaid
 graph TB
-    subgraph PY["Python LangGraph Process"]
-        MG["Master Graph<br/>Router · Planner · Verifier"]
-        MP["Placement Sub-Graph"]
-        MR["Routing Sub-Graph"]
-        ME["Editing Sub-Graph"]
-        MG -->|delegate| MP
-        MG -->|delegate| MR
-        MG -->|delegate| ME
+    subgraph DockerEnv["🐳 Docker Container"]
+        subgraph PY["Agent process"]
+            MG["LangGraph Master Orchestrator\n(Graph A)"]
+            LLM["LLM provider\n(cloud / Ollama / NIM)"]
+            EUC["EU Compiler Node"]
+            SYN["Script Synthesis Node\n(RAG → LLM → REPL)"]
+            REPL["Python REPL\n(sandbox dry-run)"]
+            REG[("EU Registry\nJinja2 templates")]
+            MG -->|plan| EUC
+            EUC <--> REG
+            EUC -. no template .-> SYN
+            SYN --> RAG_Q
+            SYN --> LLM
+            SYN --> REPL
+            SYN -->|validated code| EUC
+        end
+        RAG_Q["RAG Service"]
+        CDB[("ChromaDB\n:8001")]
+        RAG_Q <--> CDB
     end
-    subgraph CPP["C++ EDA Process (execution only)"]
-        DB["DB MCP (always-on)"]
-        WIN["Windows MCP (always-on)"]
-        P["Placement engine (on-demand)"]
-        R["Routing engine (on-demand)"]
-        E["Editing engine (on-demand)"]
+
+    subgraph HOST["Proprietary EDA host (Virtuoso / ICC2 / KLayout)  ── host OS"]
+        HEA["Host Execution Agent (HEA)\nMCP server, queue, no graph"]
+        SS[("Shared State Store\nin-host KV dict")]
+        WA["Window Adapter"]
+        DA["DB Adapter"]
+
+        HEA --- SS
+        HEA --- WA
+        HEA --- DA
     end
-    subgraph LLMG["LLM"]
-        LLM["Commercial or local"]
-    end
-    MP <-->|MCP| DB
-    MP <-->|MCP| WIN
-    MP <-->|MCP| P
-    MR <-->|MCP| DB
-    MR <-->|MCP| R
-    ME <-->|MCP| DB
-    ME <-->|MCP| E
-    MG <-->|REST| LLM
-    MP <-->|REST| LLM
-    MR <-->|REST| LLM
+
+    EUC -->|deploy_eu| HEA
+    MG <-->|query_state / write_state| HEA
+    HEA -. successful novel EU .-> REG
 
     style MG fill:#e67e22,color:#fff
-    style MP fill:#f39c12,color:#fff
-    style MR fill:#f39c12,color:#fff
-    style ME fill:#f39c12,color:#fff
-    style DB fill:#2ecc71,color:#fff
-    style WIN fill:#2ecc71,color:#fff
+    style EUC fill:#f39c12,color:#fff
+    style SYN fill:#e67e22,color:#fff
+    style REPL fill:#e67e22,color:#fff
+    style REG fill:#d4ac0d,color:#fff
+    style HEA fill:#8e44ad,color:#fff
+    style SS fill:#6c3483,color:#fff
     style LLM fill:#9b59b6,color:#fff
+    style RAG_Q fill:#1a6b9a,color:#fff
+    style CDB fill:#1a6b9a,color:#fff
+    style DockerEnv fill:#0d2137,color:#ccc,stroke:#3498db,stroke-width:2px
 ```
 
-### 8.2 Principles
+### 10.2 Core components
 
-1. **Master stays lightweight** — it routes, plans, and verifies. Domain logic lives in sub-graphs.
-2. **C++ is execution-only** — servers never call LLMs or make routing decisions.
-3. **Inter-server queries are fast** — same-process servers use direct memory; out-of-process servers use MCP. One unified `ToolClient` interface hides the transport.
-4. **Sub-graphs are autonomous** — each domain sub-graph queries DB/Windows/RAG independently to resolve its own parameters.
-5. **Modularity preserved** — C++ owns capability exposure; Python owns orchestration.
+**Execution Unit (EU)** — a pre-compiled, self-contained, language-specific script bundle (SKILL, Tcl, or Python depending on host) that performs one atomic multi-step task (e.g., a place→DRC→fix loop). EUs declare their inputs, outputs, and required window ops up front. They follow a strict preamble/epilogue convention for reading and writing the state store.
 
-### 8.3 Master Graph (complete)
+**Host Execution Agent (HEA)** — a minimal MCP server embedded in the host. Its only jobs are: receive EUs, enqueue them on the host's main thread via idle callback, execute, stream logs, and expose the state store. It is not a graph runtime. It is ~200 lines of host-native code.
 
-```mermaid
-graph TD
-    S(("Start")) --> R["Router"]
-    R -->|design query| QE["Query Exec<br/>DB + RAG"]
-    R -->|simple action| SE["Simple Exec"]
-    R -->|complex| PL["Planner"]
-    R -->|ambiguous| HC["Clarify<br/>(interrupt)"]
-    HC --> R
-    PL --> PA["Plan Approval<br/>(interrupt)"]
-    PA -->|approved| LC["Tool Lifecycle<br/>start on-demand servers"]
-    PA -->|modify| PL
-    PA -->|cancel| E((End))
-    LC --> MX["Master Executor"]
-    MX -->|P&R| PSG["Placement SG"]
-    MX -->|Routing| RSG["Routing SG"]
-    MX -->|Edit| ESG["Editing SG"]
-    SE -->|MCP| VMCP["Viewing MCP"]
-    SE -->|MCP| EMCP["Editing MCP"]
-    PSG & RSG & ESG & QE & SE --> MV["Master Verifier"]
-    MV -->|passed, more| MX
-    MV -->|all done| MEM["Memory"]
-    MV -->|failed| RP["Re-Planner"]
-    RP --> MX
-    RP -->|max retries| HE["Escalate"]
-    HE --> RP
-    MEM --> E
+**EU Compiler Node** — a LangGraph node that turns a parsed intent into a ready-to-deploy EU. Four sub-steps:
+1. Check the registry for a matching Jinja2 template
+2. Render the template with state parameters
+3. If no template exists, delegate to the **Script Synthesis Node**
+4. Statically validate the rendered script before calling `deploy_eu`
 
-    style R fill:#4a90d9,color:#fff
-    style PL fill:#7b68ee,color:#fff
-    style MX fill:#e67e22,color:#fff
-    style MV fill:#27ae60,color:#fff
-    style RP fill:#f39c12,color:#fff
-    style HC fill:#e74c3c,color:#fff
-    style PA fill:#e74c3c,color:#fff
-    style HE fill:#e74c3c,color:#fff
+**Script Synthesis Node** — activated when the registry has no matching template. Pipeline:
+1. **RAG retrieval** — query ChromaDB for the top-k relevant vendor API doc chunks (e.g., `hiZoomIn`, `geRunDRC`, `pya.LayoutView.insert`) relevant to the capability and target host
+2. **LLM synthesis** — prompt the configured LLM with the API context to produce a SKILL / Tcl / Python EU
+3. **REPL dry-run** — for KLayout-Python EUs, execute in an isolated `subprocess` inside the container to catch runtime errors before they reach the host; for SKILL / Tcl, apply static syntax validators (balanced parentheses / braces)
+4. **Repair loop** — on validation failure, re-prompt the LLM with the error detail (budget: 2 repair attempts)
+5. Return validated code to the EU Compiler Node
+
+**Python REPL (sandbox)** — a lightweight subprocess executor (`python_repl.py`) that runs KLayout-Python EU code with mocked `pya` stubs. It captures stdout/stderr and exits with a structured result. It is not an interactive shell — the REPL runs a single EU payload and terminates. It is never deployed to the host; its only job is to catch runtime errors before `deploy_eu` is called.
+
+**Shared State Store** — a key-value dict living in host memory. EUs read `input.*` keys, write `output.*` keys. The orchestrator seeds inputs via `write_state` and harvests outputs via `query_state`. The store decouples EU-to-EU data flow from external round-trips.
+
+**EU Registry** — an on-disk library of Jinja2 templates, one tree per target host:
+
+```text
+vlsi/agent/src/orchestrator/eu_registry/
+├── cadence_virtuoso/
+│   ├── place_drc_loop.skill.j2
+│   ├── route_nets.skill.j2
+│   ├── place_cells.skill.j2
+│   └── get_bbox.skill.j2
+├── synopsys_icc2/
+│   ├── place_drc_loop.tcl.j2
+│   ├── route_nets.tcl.j2
+│   └── place_cells.tcl.j2
+├── klayout/
+│   ├── zoom_and_highlight.py.j2
+│   └── draw_early_routes.py.j2
+└── manifest.json         # declares inputs/outputs/window_ops per template
 ```
 
-### 8.4 Placement Sub-Graph Example
+### 10.3 State store contract
 
-A single delegation with sibling queries, LLM-driven command synthesis, DRC loop, and convergence.
+Each EU template follows a standard preamble/epilogue. This is what makes EUs composable without orchestrator mediation.
+
+**Virtuoso SKILL example** — `place_drc_loop.skill.j2`:
+
+```
+let((cellName maxIter iter drcClean)
+    ; --- preamble: read seeded inputs from state store ---
+    cellName = euStateGet("input.cell_name")
+    maxIter  = {{ max_iter }}                  ; compile-time constant
+    iter = 0
+    drcClean = nil
+
+    ; --- body: tight in-host loop, zero IPC per iteration ---
+    while(!drcClean && iter < maxIter
+        geMoveCellsByRule(cellName)
+        drcClean = geRunDRC(cellName)
+        iter++
+    )
+
+    ; --- epilogue: write outputs to state store ---
+    euStateSet("output.iter_count" iter)
+    euStateSet("output.drc_passed" drcClean)
+)
+```
+
+The HEA helper functions `euStateGet` / `euStateSet` are pre-installed when the HEA loads. EU2 can read `output.*` from EU1 directly without LangGraph in the middle.
+
+### 10.4 EU Compiler Node (pseudocode)
+
+```python
+def compile_eu_node(state: State) -> dict:
+    capability = state.capability
+    host       = state.target_host
+    params     = state.capability_params
+
+    # 1. Registry lookup first
+    eu_code = try_render_from_registry(host, capability, params)
+    source  = "registry"
+
+    # 2. Fallback: Script Synthesis (RAG → LLM → REPL)
+    if eu_code is None:
+        eu_code, source = script_synthesis_node(
+            capability, host, params, repair_budget=state.repair_budget
+        )
+        if eu_code is None:          # synthesis failed all repair attempts
+            return {"pending_eu": None, "eu_error": source}
+
+    # 3. Static validation — catch syntax errors before they hit the host
+    validation = validate_eu(eu_code, language=language_for(host))
+    if not validation.ok:
+        return {"pending_eu": None, "eu_error": validation.error}
+
+    return {
+        "pending_eu": ExecutionUnit(
+            id=f"eu_{uuid4()}",
+            language=language_for(host),
+            code=eu_code,
+            source=source,
+            declared_inputs=params.keys(),
+            declared_outputs=manifest_outputs_for(capability),
+            timeout_s=state.timeout_s or 120,
+        )
+    }
+
+
+def script_synthesis_node(capability, host, params, repair_budget=2):
+    """RAG-augmented LLM synthesis + REPL dry-run."""
+    language = language_for(host)
+
+    # Step 1: RAG retrieval — pull vendor API doc chunks from ChromaDB
+    api_context = rag_service.retrieve(
+        query=f"{capability} {host} {language}",
+        collection=chroma_collection_for(host),
+        top_k=8,
+    )
+
+    eu_code = None
+    for attempt in range(repair_budget + 1):
+        # Step 2: LLM synthesis with API context
+        eu_code = llm.generate_eu(
+            capability=capability,
+            host=host,
+            language=language,
+            params=params,
+            api_context=api_context,
+            repair_error=locals().get("last_error"),
+        )
+
+        # Step 3a: REPL dry-run for Python EUs (KLayout)
+        if language == "klayout_python":
+            repl_result = python_repl.run(eu_code, stubs=KLAYOUT_STUBS)
+            if not repl_result.ok:
+                last_error = repl_result.error
+                continue
+
+        # Step 3b: Static syntax validation for SKILL / Tcl
+        validation = validate_eu(eu_code, language=language)
+        if validation.ok:
+            return eu_code, "llm_generated"
+        last_error = validation.error
+
+    return None, f"synthesis_failed: {last_error}"
+```
+
+`validate_eu` is cheap and deterministic: balanced parentheses for SKILL, balanced braces for Tcl, `ast.parse` for Python. The REPL dry-run catches runtime errors (undefined variables, bad `pya` calls) before they reach the host. The goal is to prevent a half-executed EU from leaving the host DB dirty.
+
+### 10.5 Host-specific HEA implementations
+
+Each host has different threading rules, but the HEA interface is identical. The key is deferring execution to the host's idle callback so EU scripts never block the UI thread or the WebSocket I/O loop.
 
 <details>
-<summary><b>Expand: "place decoupling caps near power pins" — step-by-step</b></summary>
+<summary><b>KLayout (Python + PyQt event loop)</b></summary>
 
-```mermaid
-sequenceDiagram
-    participant M as Master
-    participant PS as Placement SG
-    participant L as LLM
-    participant P as Placement MCP
-    participant DB as DB MCP
-    participant W as Windows MCP
+```python
+# runs inside KLayout
+import pya
 
-    M->>PS: Place decap caps near power pins
-    Note over PS: Self-Diagnosis
-    PS->>L: what data do I need?
-    L-->>PS: cell names, pin locs, region, viewport
-    Note over PS: Sibling Queries
-    PS->>DB: get_object_ids(filter="decap_cell")
-    DB-->>PS: [id_101, id_102, id_103]
-    PS->>DB: get_bounding_box(power_domain_A)
-    DB-->>PS: {0,0,500,300}
-    PS->>W: get_active_window
-    W-->>PS: {layout_1, zoom:0.5}
-    Note over PS: Synthesis + Execute
-    PS->>L: generate placement params
-    L-->>PS: {cells, coords, constraints}
-    PS->>P: place_cells(...)
-    P-->>PS: {done, violations:3}
-    Note over PS: Verifier loop
-    PS->>P: run_drc(power_domain_A)
-    P-->>PS: 3 overlaps
-    PS->>L: adjust placement
-    L-->>PS: adjusted_coords
-    PS->>P: place_cells(...)
-    P-->>PS: {done, violations:0}
-    PS->>P: run_drc
-    P-->>PS: clean
-    PS-->>M: {success, cells:3, iterations:2}
+_state_store: dict = {}
+
+class KLayoutHEA:
+    def on_deploy_eu(self, eu: ExecutionUnit):
+        # Never execute on the WS thread — defer to Qt main thread
+        pya.Application.instance().post_runnable(
+            lambda: self._execute_native(eu)
+        )
+
+    def _execute_native(self, eu: ExecutionUnit):
+        local_env = {
+            "window_adapter": KLayoutWindowAdapter(),
+            "db_adapter":     KLayoutDBAdapter(),
+            "state_in":       _state_store,
+            "state_out":      {},
+        }
+        try:
+            exec(eu.code, globals(), local_env)
+            _state_store.update(local_env["state_out"])
+            return {"status": "success",
+                    "output_keys": list(local_env["state_out"].keys())}
+        except Exception as e:
+            return {"status": "error", "error_detail": str(e)}
 ```
 
 </details>
 
-### 8.5 Security & Deployment
+<details>
+<summary><b>Cadence Virtuoso (SKILL)</b></summary>
 
-- **Dual-model support** — sanitized planning → commercial cloud LLM; data-sensitive specialist loops → on-prem GPU (NIM, vLLM, Ollama).
-- **Fully air-gappable** — supports 100% on-premises deployment within the corporate LAN.
+```
+; HEA running inside Virtuoso
+euQueue = list()
+euStateStore = list()
+
+procedure(euStateSet(key val)
+    euStateStore = putAssoc(key val euStateStore)
+)
+procedure(euStateGet(key)
+    cdr(assoc(key euStateStore))
+)
+
+procedure(handleDeployEu(euCode)
+    euQueue = append1(euQueue euCode)
+    hiSetIdleCallback(
+        lambda(()
+            let((code)
+                code = car(euQueue)
+                euQueue = cdr(euQueue)
+                errset( evalstring(code) )
+            )
+        )
+        nil  ; one-shot
+    )
+    return("EU Enqueued")
+)
+```
+
+</details>
+
+<details>
+<summary><b>Synopsys ICC2 / Custom Compiler (Tcl)</b></summary>
+
+```tcl
+# HEA running inside ICC2
+array set eu_state_store {}
+
+proc eu_state_set {key val} {
+    global eu_state_store
+    set eu_state_store($key) $val
+}
+proc eu_state_get {key} {
+    global eu_state_store
+    return $eu_state_store($key)
+}
+
+proc handle_deploy_eu {eu_code} {
+    # Defer to the main event loop so we never block it
+    after idle [list eval_eu_code $eu_code]
+    return "EU Enqueued"
+}
+
+proc eval_eu_code {code} {
+    if {[catch {eval $code} result]} {
+        # stream failure
+    } else {
+        # outputs already in eu_state_store via eu_state_set
+    }
+}
+```
+
+</details>
+
+### 10.6 Registry feedback loop (self-learning agent)
+
+The registry is not static. When the LLM synthesizes a novel EU and it runs successfully, the orchestrator parameterizes it back into a reusable template:
+
+```mermaid
+flowchart LR
+    A["User asks for<br/>novel workflow"] --> B["EU Compiler:<br/>no template hit"]
+    B --> C["LLM synthesizes EU"]
+    C --> D["validate_eu"]
+    D -->|fail| E["repair loop"]
+    E --> C
+    D -->|pass| F["deploy_eu → HEA"]
+    F --> G["EU runs successfully"]
+    G --> H["maybe_persist_eu_to_registry"]
+    H --> I["parameterize literals<br/>→ {{ variables }}"]
+    I --> J["save to eu_registry/<br/>+ manifest entry"]
+    J --> K["Next similar request<br/>hits registry directly"]
+
+    style C fill:#9b59b6,color:#fff
+    style F fill:#8e44ad,color:#fff
+    style J fill:#d4ac0d,color:#fff
+```
+
+```python
+def maybe_persist_eu_to_registry(eu: ExecutionUnit,
+                                  state: State,
+                                  result: EUResult):
+    if eu.source != "llm_generated" or not result.success:
+        return
+
+    template = parameterize_eu(eu.code, state.capability_params)
+    path = f"eu_registry/{state.target_host}/{state.capability}.{eu.language}.j2"
+
+    if not exists(path):  # don't clobber existing templates
+        write_template(path, template)
+        update_manifest(path,
+                        inputs=eu.declared_inputs,
+                        outputs=eu.declared_outputs)
+        log.info(f"persisted new EU template: {path}")
+```
+
+Over time the registry grows from actual usage rather than manual authoring. Eviction of stale or superseded templates is a separate maintenance concern and is handled by the `tools/eu_registry_prune.py` script.
+
+### 10.7 Security and deployment
+
+- **Dual-model support** — sanitized planning inputs can go to a commercial cloud LLM; EU synthesis that sees sensitive design data can be routed to a locally-hosted model. The policy knob is per-request.
+- **Fully air-gappable** — the HEA is an MCP server on localhost; the registry is on disk; the LLM can be fully local. The entire stack supports on-premises deployment inside the corporate LAN.
+- **EU validation is the main safety boundary.** A validated EU can still do anything the host's scripting language allows — the agent must never deploy EUs that were not produced by the trusted compiler pipeline. The HEA rejects EUs whose `eu_id` is not pre-registered in the current session.
+
+### 10.8 What the EU pattern is not
+
+- **Not a replacement for the C++ daemon.** The external layer still exists for custom algorithms and for use cases where the host is not running.
+- **Not a graph runtime.** The HEA executes scripts; it does not orchestrate them. All conditional logic, retries, and multi-step flow lives in LangGraph.
+- **Not a substitute for layer routing.** The policy router decides *when* to use the internal layer. The EU pattern only defines *how* that layer is implemented.
 
 ---
 
-## 9. Appendices
+## 11. Appendices
 
-### 9.1 File Map (current code)
+### 11.1 File Map (current + planned for EU pattern)
 
 ```text
 vlsi/agent/
   server.py                            FastAPI entry point (:8000)
   main.py                              CLI entry point (dev/test)
-  constraints.py                       constraint helpers (shared)
   pyproject.toml
   klayout_macro/
     chatbot_dock.py                    KLayout PyQt dock widget
     viewer_client.py                   viewer command helpers
-  src/orchestrator/
-    orchestrator_graph.py              Graph A master orchestrator
-    router_subgraph.py                 top-level routing subgraph
-    modules/
-      _cli_client.py                   shared WebSocket MCP client
-      m1_router_subgraph.py            Router module
-      m2_placer_subgraph.py            Placer module (analog + SPICE)
-      m3_db_subgraph.py                DB reader module
-      m4_window_subgraph.py            Window automation module
-    workflows/
-      w1_full_route_flow.py            Full placement + routing
-      w2_drc_fix_loop.py               Iterative DRC correction
-    utils/
-      constraints_mcp_client.py        constraints.extract client
-      early_router.py                  Manhattan early-route preview
-      env_bootstrap.py                 environment setup
-      spice_to_analog_problem.py       SPICE → analog_problem
+  src/
+    orchestrator/
+      orchestrator_graph.py            Graph A master orchestrator
+      router_subgraph.py               top-level routing subgraph
+      eu_compiler.py                   EU Compiler Node
+      script_synthesis.py              Script Synthesis Node (RAG → LLM → REPL)
+      python_repl.py                   Python REPL sandbox (KLayout-Python dry-run)
+      policy/
+        layer_router.py                internal-first routing policy + RAG tool select
+      modules/
+        _cli_client.py                 shared WebSocket MCP client (external)
+        _hea_client.py                 shared WebSocket MCP client (HEA)
+        m1_router_subgraph.py          Router module (dual-path)
+        m2_placer_subgraph.py          Placer module (analog + SPICE, dual-path)
+        m3_db_subgraph.py              DB reader module (dual-path)
+        m4_window_subgraph.py          Window automation module (dual-path)
+      workflows/
+        w1_full_route_flow.py          Full placement + routing
+        w2_drc_fix_loop.py             Iterative DRC correction (EU-preferred)
+      eu_registry/                     Jinja2 templates per host
+        cadence_virtuoso/
+        synopsys_icc2/
+        klayout/
+        manifest.json
+      utils/
+        constraints_mcp_client.py      constraints.extract client
+        early_router.py                Manhattan early-route preview
+        env_bootstrap.py               environment setup
+        spice_to_analog_problem.py     SPICE → analog_problem
+        eu_parameterize.py             literal → {{ variable }} extractor
+    hea/                               Host Execution Agent loaders
+      virtuoso/                        SKILL loader, euStateStore procedures
+      icc2/                            Tcl loader, eu_state_store array
+      klayout/                         Python loader, PyQt post_runnable wiring
+    rag/                               RAG memory system
+      rag_service.py                   Vector retrieval interface (ChromaDB client)
+      ingestor.py                      Chunk + embed vendor docs into ChromaDB
+      embeddings.py                    Embedding model abstraction (OpenAI / nomic)
+      stubs/
+        klayout_stubs.py               Mock pya API for Python REPL dry-run
 
 vlsi/eda_tools/
   eda_cli/                             C++ CLI + MCP gateway (daemon)
   routing_genetic_astar/               router library
   eda_placer/                          placer library (WIP)
   python/constraints_tool/             Python constraints MCP server
+
+docker/
+  Dockerfile                           Multi-stage build (C++ + Python + agent)
+  docker-compose.yml                   Full stack: agent, chromadb, eda_daemon, constraints, ollama*
+  chromadb/
+    config.yaml                        ChromaDB server configuration
+  nginx/
+    nginx.conf                         Optional reverse proxy (if ChromaDB is exposed)
+  scripts/
+    init_rag.sh                        First-run RAG initialization helper
+    healthcheck.sh                     Compose health probe
 ```
 
-### 9.2 Key Utilities
+### 11.2 Key Utilities
 
 <details>
 <summary><b>Early routing visualizer</b></summary>
@@ -502,7 +1068,16 @@ vlsi/eda_tools/
 
 </details>
 
-### 9.3 Viewer Commands (partial)
+<details>
+<summary><b>EU parameterization (planned)</b></summary>
+
+- File: `utils/eu_parameterize.py`
+- Function: `parameterize_eu(raw_code, params) -> jinja2_template`
+- Replaces concrete literals (cell names, coordinates, iteration counts) back into `{{ variable }}` placeholders using the `params` dict as the ground-truth mapping. Used by the registry feedback loop.
+
+</details>
+
+### 11.3 Viewer Commands (partial, external layer)
 
 | Action | Argument shape | Used by |
 |---|---|---|
@@ -512,3 +1087,277 @@ vlsi/eda_tools/
 | `refresh_view` | `{}` | m4 |
 | `screenshot` | `{path?: string}` | m4 |
 | `unlock_ui` | `{}` | `collect_outputs` |
+
+### 11.4 Glossary
+
+| Term | Meaning |
+|---|---|
+| **Internal layer** | Tool capabilities that run inside a proprietary EDA host, reached via EUs and the HEA |
+| **External layer** | Custom C++ `eda_daemon` and Python MCP tools, reached over WebSocket JSON-RPC |
+| **EU (Execution Unit)** | A validated, self-contained script bundle sent to the HEA for atomic in-host execution |
+| **HEA (Host Execution Agent)** | Minimal MCP server embedded in the host, receives EUs and exposes the state store |
+| **State Store** | In-host key-value dict that EUs read from and write to under a preamble/epilogue convention |
+| **EU Registry** | On-disk library of Jinja2 templates per target host |
+| **Layer preference** | User-expressed or LLM-inferred choice among `AUTO`, `INTERNAL_ONLY`, `EXTERNAL_ONLY`, `BOTH` |
+| **Analyze-then-augment** | The `AUTO` behavior: run internal, analyze, conditionally call external |
+| **RAG** | Retrieval-Augmented Generation — combine vector search over a knowledge base with LLM synthesis |
+| **ChromaDB** | Open-source single-node vector database used as the RAG backing store |
+| **Script Synthesis Node** | LangGraph node that runs RAG → LLM → REPL to produce a novel EU when the registry has no template |
+| **Python REPL (sandbox)** | Isolated subprocess that dry-runs KLayout-Python EU code with mocked `pya` stubs before host deploy |
+| **LLM Provider** | Configurable backend for LLM calls: commercial cloud, local Ollama, or customer NIM endpoint |
+| **RAG Ingestor** | One-shot CLI that chunks and embeds EDA vendor docs into ChromaDB at install / version-update time |
+
+---
+
+## 12. RAG Memory System
+
+The RAG memory system is the agent's knowledge base for EDA tool APIs and usage patterns. It serves three purposes:
+
+1. **Tool selection** — the policy router queries the RAG to determine which tool or router variant applies to a given design/capability (e.g., decide standard-cell router vs. device router vs. memory router before dispatching).
+2. **Script synthesis context** — the Script Synthesis Node retrieves the relevant vendor API functions before asking the LLM to write a novel EU. This dramatically reduces hallucinated API names.
+3. **User query answering** — `chat_node` can retrieve API doc excerpts to answer questions like "how do I move a cell by 10 units in Virtuoso?" and return an accurate reference.
+
+### 12.1 Data sources
+
+| EDA host | API language | Doc source |
+|---|---|---|
+| Cadence Virtuoso / Custom Compiler | SKILL | Cadence SKILL Reference Manual (ICADVM) — vendor-provided PDF/HTML |
+| Synopsys ICC2 | Tcl | ICC2 Command Reference — `man` pages extracted per release |
+| KLayout | Python (`pya`) | KLayout class reference — `pya` module docstrings and online reference |
+| Custom additions | Any | Internal Q&A pairs, annotated run examples, EU registry examples |
+
+Docs are processed at **image build time** — the ingestor runs during `docker build` and bakes the embeddings into a named Docker volume snapshot. On a version update the admin runs:
+
+```bash
+docker exec agent python -m rag.ingestor --source /eda_docs/ --host virtuoso --version icadvm_23_1
+```
+
+This re-indexes only the specified collection and leaves others untouched.
+
+### 12.2 ChromaDB collections
+
+One collection per EDA host × software version to isolate embeddings and allow version-specific queries:
+
+```
+chromadb collections
+├── virtuoso_icadvm_23_1          # Cadence Virtuoso SKILL API
+├── virtuoso_icadvm_22_1          # previous version — kept for rollback
+├── custom_compiler_icadvm_23_1   # Synopsys Custom Compiler Tcl
+├── icc2_p2024                    # Synopsys ICC2 Tcl
+└── klayout_0_29                  # KLayout Python pya
+```
+
+Naming convention: `<tool_slug>_<version_slug>` — no spaces, lowercase. The RAG service resolves the correct collection from `state.target_host` and `state.eda_version`.
+
+### 12.3 ChromaDB limitations
+
+> These are known constraints of the open-source ChromaDB single-node edition. Plan around them.
+
+| Limitation | Impact | Mitigation |
+|---|---|---|
+| **Single-node only** | No clustering or HA | Run one ChromaDB sidecar per Docker container; snapshots via named volume |
+| **No built-in auth** | Any process on the compose network can query/write | Expose only on internal Docker network; do not bind to `0.0.0.0` |
+| **Data on named volume** | Embeddings lost if volume destroyed | Back up `chroma_data` volume before `docker volume rm` |
+| **Performance above ~1 M vectors** | Query latency degrades | Partition by tool + version; prune old collections after 2 releases |
+| **No built-in versioning** | Cannot diff collections | Enforce version-slug naming; keep N−1 collection as rollback |
+
+### 12.4 RAG retrieval pipeline
+
+```mermaid
+flowchart LR
+    Q["Query\n(capability + host + language)"]
+    E["Embed query\n(embedding model)"]
+    CDB[("ChromaDB\ncollection")]
+    CH["Top-k chunks\n(API doc excerpts)"]
+    CTX["api_context\npassed to LLM prompt"]
+
+    Q --> E --> CDB --> CH --> CTX
+
+    style CDB fill:#1a6b9a,color:#fff
+    style CTX fill:#e67e22,color:#fff
+```
+
+- Embedding model: `text-embedding-3-small` (OpenAI) or `nomic-embed-text` (local, via Ollama)
+- `top_k = 8` for script synthesis, `top_k = 3` for tool selection and chat answers
+- Chunks are ~400 tokens each with 50-token overlap; metadata carries `{host, version, api_name, language}`
+
+### 12.5 Update lifecycle
+
+```mermaid
+sequenceDiagram
+    participant A as Admin
+    participant I as RAG Ingestor
+    participant CDB as ChromaDB
+    participant S as Agent startup
+
+    Note over S: First install
+    S->>I: --init (from image bake or volume mount)
+    I->>I: chunk + embed bundled docs
+    I->>CDB: upsert collection virtuoso_icadvm_23_1
+
+    Note over A: EDA version update
+    A->>I: docker exec agent python -m rag.ingestor --host virtuoso --version icadvm_24_0
+    I->>I: chunk + embed new docs
+    I->>CDB: create collection virtuoso_icadvm_24_0
+    I->>CDB: keep old collection (rollback)
+
+    Note over A: Optional — prune old
+    A->>CDB: delete collection virtuoso_icadvm_22_1
+```
+
+---
+
+## 13. Docker Deployment
+
+The entire agent stack ships as a Docker Compose project. The same image that is tested in-house is delivered to the customer — no re-compilation at the customer site.
+
+### 13.1 Service map
+
+```mermaid
+graph LR
+    subgraph DC["docker-compose.yml"]
+        A["agent\n:8000\nFastAPI + LangGraph"]
+        CDB["chromadb\n:8001\nvector store"]
+        D["eda_daemon\n:8080\nC++ routing/placement"]
+        C["constraints\n:18081\nSPICE parser MCP"]
+        O["ollama *(optional)*\n:11434\nlocal LLM"]
+    end
+
+    H["Host EDA tool\n(Virtuoso / ICC2 / KLayout)\n+ HEA :18082"]
+    UI["User dock\n(PyQt / Tk / native)"]
+
+    UI -- "HTTP :8000\n(host→container)" --> A
+    A -- internal net --> CDB
+    A -- internal net --> D
+    A -- internal net --> C
+    A -. "if LLM_PROVIDER=ollama" .-> O
+    A -- "host.docker.internal:18082\n(container→host)" --> H
+
+    style DC fill:#0d2137,color:#ccc,stroke:#3498db,stroke-width:2px
+    style H fill:#8e44ad,color:#fff
+```
+
+### 13.2 docker-compose.yml (reference)
+
+```yaml
+version: "3.9"
+
+services:
+  agent:
+    image: vlsi-agent:latest
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # LLM provider — pick one block:
+      # Commercial cloud
+      - LLM_PROVIDER=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Local Ollama (uncomment to use)
+      # - LLM_PROVIDER=ollama
+      # - OLLAMA_BASE_URL=http://ollama:11434
+      # Customer NIM or custom OpenAI-compatible endpoint
+      # - LLM_PROVIDER=openai_compatible
+      # - LLM_BASE_URL=${LLM_BASE_URL}
+      # - LLM_API_KEY=${LLM_API_KEY}
+      - CHROMA_URL=http://chromadb:8001
+      - EDA_DAEMON_URL=ws://eda_daemon:8080
+      - HEA_URL=ws://host.docker.internal:18082
+      - EDA_HOST=virtuoso                  # or icc2, klayout
+      - EDA_VERSION=icadvm_23_1
+    volumes:
+      - eda_docs:/eda_docs:ro              # vendor doc mount (read-only)
+    depends_on:
+      - chromadb
+      - eda_daemon
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "127.0.0.1:8001:8000"             # internal only — not exposed to LAN
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  eda_daemon:
+    image: vlsi-agent:latest
+    command: ["./eda_daemon", "--port", "8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  constraints:
+    image: vlsi-agent:latest
+    command: ["python", "-m", "constraints_tool.mcp_server", "--port", "18081"]
+    ports:
+      - "127.0.0.1:18081:18081"
+
+  # Optional: local Ollama — uncomment when LLM_PROVIDER=ollama
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_models:/root/.ollama
+
+volumes:
+  chroma_data:
+  eda_docs:
+  # ollama_models:
+```
+
+### 13.3 Networking rules
+
+| Traffic | Direction | Address |
+|---|---|---|
+| User dock → agent | Host → container | `localhost:8000` → container `:8000` |
+| Agent → ChromaDB | Container → container | `http://chromadb:8001` (internal net) |
+| Agent → eda_daemon | Container → container | `ws://eda_daemon:8080` (internal net) |
+| Agent → HEA | Container → host | `ws://host.docker.internal:18082` |
+| Agent → cloud LLM | Container → internet | Through host network (requires outbound HTTPS) |
+| Agent → Ollama | Container → container | `http://ollama:11434` (internal net, if enabled) |
+
+> **Linux note.** `host.docker.internal` is not available by default on Linux. Add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `agent` service, or set `HEA_URL` to the host's LAN IP.
+
+### 13.4 LLM provider configuration
+
+The agent supports three LLM provider modes selected by the `LLM_PROVIDER` environment variable:
+
+| `LLM_PROVIDER` | Required env vars | When to use |
+|---|---|---|
+| `openai` | `OPENAI_API_KEY` | Standard cloud deployment; best model quality |
+| `ollama` | `OLLAMA_BASE_URL` | Air-gapped / on-premises; enable the `ollama` service in compose |
+| `openai_compatible` | `LLM_BASE_URL`, `LLM_API_KEY` | Nvidia NIM, Azure OpenAI, or any OpenAI-compatible endpoint |
+
+The same variable controls the embedding model: `openai` → `text-embedding-3-small`; `ollama` / `openai_compatible` → `nomic-embed-text` (must be available at `OLLAMA_BASE_URL` or `LLM_BASE_URL`).
+
+### 13.5 Installation and first run
+
+```bash
+# 1. Pull / build the image
+docker compose pull          # or: docker compose build
+
+# 2. Mount vendor docs (copy PDFs / HTML from EDA tool installation)
+docker volume create eda_docs
+docker run --rm -v eda_docs:/docs -v /path/to/vendor/docs:/src alpine \
+    cp -r /src/. /docs/
+
+# 3. Initialize RAG embeddings (one-time, ~5–15 min depending on doc size)
+docker compose run --rm agent python -m rag.ingestor --init
+
+# 4. Start all services
+docker compose up -d
+
+# 5. Health check
+curl http://localhost:8000/health
+# {"status": "ok", "agent": "ready", "rag": "ready", "chroma_collections": 3}
+```
+
+### 13.6 Running ports (full stack)
+
+| Port | Host binding | Service |
+|---|---|---|
+| `8000` | `0.0.0.0:8000` | Agent FastAPI (`/chat`, `/health`) |
+| `8001` | `127.0.0.1:8001` | ChromaDB (internal; do not expose to LAN) |
+| `8080` | `127.0.0.1:8080` | C++ `eda_daemon` |
+| `18081` | `127.0.0.1:18081` | Constraints MCP |
+| `18082` | host (not in Docker) | HEA in EDA host process |
+| `11434` | `127.0.0.1:11434` | Ollama (if enabled) |

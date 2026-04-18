@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "python_programs"
+		},
+		{
+			"path": "vlsi"
 		}
 	],
 	"settings": {

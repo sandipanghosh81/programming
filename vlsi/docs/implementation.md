@@ -2,35 +2,51 @@
 
 > **Scope**: C++23 routing engine, MCP server layer, Python bindings, build/test infrastructure.
 > **Audience**: C++ engineers building or extending the routing / placement engines.
-> **Companion**: [`architecture.md`](./architecture.md) — agent-layer (Python / LangGraph) view.
+> **Companion**: [`architecture.md`](./architecture.md) — agent-layer (Python / LangGraph) view, including Docker deployment (§13) and RAG memory system (§12).
 
 This document is the **C++ implementation plan** for the VLSI routing engine that lives under `vlsi/eda_tools/`. It covers how the code is organized into libraries, the key classes in each library, threading rules, transport, Python bindings, the build system, and the verification plan.
 
+> **Deployment note (as of current architecture):** The `eda_daemon` binary runs as a Docker service (`docker-compose.yml` service: `eda_daemon`) alongside the Python agent, ChromaDB, and the constraints MCP server. See [`architecture.md §13`](./architecture.md#13-docker-deployment) for the full Docker setup. The C++ build produces a Linux/amd64 static binary that is copied into the agent Docker image during the multi-stage Docker build — no re-compilation at the customer site.
+
 Each section is self-contained. Use the collapsed `<details>` blocks inside each library section for deep-dive class references — skip them if you're not touching that layer.
+
+## 1. Requirements & Scope
+
+This C++ layer is the **external tool layer** of the VLSI agent (see [`architecture.md`](./architecture.md) §4). It is a standalone process — the `eda_daemon` — that hosts custom routing, placement, DB, and window-automation libraries behind a WebSocket JSON-RPC gateway on port `:8080`. The LangGraph orchestrator reaches it through the **external branch** of each dual-path module subgraph (`m1` router, `m2` placer, `m3` DB, `m4` window) using the shared `_cli_client.mcp_call(method, params)` interface.
+
+This layer is one of two tool layers in the agent:
+
+- **External tool layer (this document)** — custom C++ algorithms in the standalone `eda_daemon` process. Reached via JSON-RPC. Home of `routing_genetic_astar`, `eda_placer`, DB reader, window automation.
+- **Internal tool layer (not this document)** — host-embedded Host Execution Agent (HEA) running inside a proprietary EDA tool (Cadence Virtuoso, Synopsys ICC2, KLayout). Reached via MCP tools (`deploy_eu`, `query_state`, `write_state`, `stream_log`). Implemented in host-native scripting (SKILL, Tcl, or in-process Python). Documented in [`architecture.md`](./architecture.md) §10.
+
+The two layers cooperate under the orchestrator's routing policy (`AUTO` / `INTERNAL_ONLY` / `EXTERNAL_ONLY` / `BOTH`). For many capabilities — notably `route_nets` and `place_cells` — peer implementations exist in both layers, and the orchestrator may run one, the other, or both for cross-validation. Nothing in this C++ codebase depends on the HEA or on any proprietary host; the daemon is fully standalone and supports `EXTERNAL_ONLY` workflows as well as the external branch of `AUTO` / `BOTH` workflows.
+
+> **What this document does not cover:** the HEA implementations (SKILL / Tcl / PyQt) that live inside proprietary hosts, the EU registry (Jinja2 templates), the EU compiler node, or the policy router — all of those belong to the Python agent layer and are covered in `architecture.md` §10 and the companion `hea/` source tree.
 
 ---
 
 ## Contents
 
-1. [Overview and Goals](#1-overview-and-goals)
-2. [System Architecture](#2-system-architecture) — layers and data flow
-3. [Library Map](#3-library-map) — 13 libraries and their dependency graph
-4. [Directory Layout](#4-directory-layout)
-5. [Library Reference](#5-library-reference) — class-by-class, collapsed by default
-6. [C++ Features Guide](#6-c-features-guide) — C++17 / C++20 / C++23 usage
-7. [Design Patterns Guide](#7-design-patterns-guide)
-8. [Threading Guide](#8-threading-guide)
-9. [Python Bindings](#9-python-bindings)
-10. [Transport / WebSocket](#10-transport--websocket)
-11. [Build System](#11-build-system)
-12. [Implementation Roadmap](#12-implementation-roadmap)
-13. [Verification Plan](#13-verification-plan)
+1. [Requirements & Scope](#1-requirements--scope)
+2. [Overview and Goals](#2-overview-and-goals)
+3. [System Architecture](#3-system-architecture) — layers and data flow
+4. [Library Map](#4-library-map) — 13 libraries and their dependency graph
+5. [Directory Layout](#5-directory-layout)
+6. [Library Reference](#6-library-reference) — class-by-class, collapsed by default
+7. [C++ Features Guide](#7-c-features-guide)
+8. [Design Patterns Guide](#8-design-patterns-guide)
+9. [Threading Guide](#9-threading-guide)
+10. [Python Bindings](#10-python-bindings)
+11. [Transport / WebSocket](#11-transport--websocket)
+12. [Build System](#12-build-system)
+13. [Implementation Roadmap](#13-implementation-roadmap)
+14. [Verification Plan](#14-verification-plan)
 
 ---
 
-## 1. Overview and Goals
+## 2. Overview and Goals
 
-The C++ layer is the **execution substrate** — it performs chip routing and placement with no LLM dependency. The Python LangGraph orchestrator (see [`architecture.md`](./architecture.md)) calls into it over JSON-RPC. Inside the C++ process, all algorithm code runs in one address space and shares a single design database, making cross-module calls zero-copy.
+The C++ layer is the **external tool layer** and its execution substrate — it performs chip routing and placement with no LLM dependency. The Python LangGraph orchestrator (see [`architecture.md`](./architecture.md)) reaches it over WebSocket JSON-RPC whenever a module's external branch is selected by the policy router. Inside the C++ process, all algorithm code runs in one address space and shares a single design database, making cross-module calls zero-copy.
 
 > **City analogy** — a routed chip is a city's road network. `GlobalPlanner` sketches highway corridors; `NegotiatedRoutingLoop` is traffic management negotiating conflicts; `ThreadManager` is the transport authority owning every vehicle; the MCP servers are service departments (DB, Windows, Placement, ...) each reachable by a clean JSON-RPC API.
 
@@ -46,8 +62,9 @@ The C++ layer is the **execution substrate** — it performs chip routing and pl
 | G6 | EDA DB interop | LEF/DEF native; OpenAccess adapter |
 | G7 | Memory efficient | <8 GB for 1 M nets via arena allocators |
 | G8 | Python scriptable | Full API via pybind11 |
-| G9 | LLM-ready | JSON state export; LangGraph orchestration layer |
+| G9 | Orchestrator-ready | JSON state export; serves external-branch modules via JSON-RPC on `:8080` |
 | G10 | Reproducible | Deterministic with same RNG seed |
+| G11 | Peer-comparable | Produces QoR metrics (wirelength, via count, DRC) in a form the orchestrator can compare against internal-layer (HEA/EU) results for `BOTH` policy mode |
 
 <details>
 <summary><b>Node coverage matrix</b></summary>
@@ -80,42 +97,58 @@ The C++ layer is the **execution substrate** — it performs chip routing and pl
 
 ---
 
-## 2. System Architecture
+## 3. System Architecture
 
-Two layers: a **Python LangGraph orchestrator** (AI brain) and the **C++ execution layer** (pure compute). Communication uses JSON-RPC 2.0 over WebSocket/HTTP for out-of-process calls, or direct pybind11 calls for in-process use.
+The C++ daemon is a standalone process that the Python LangGraph orchestrator reaches over WebSocket JSON-RPC. Inside the daemon, all algorithm code runs in one address space and shares a single design database (`SharedDatabase`), making cross-module calls zero-copy. This is the **external tool layer** — peer to the internal tool layer (HEA / EUs inside proprietary hosts) but wholly separate from it.
+
+<details>
+<summary><b>3.1 External Tool Layer Architecture</b></summary>
+
+The daemon's JSON-RPC gateway (`libtransport` + `libmcp_base` + `libmcp_servers`) accepts method calls from the orchestrator's `_cli_client.mcp_call()` and dispatches them to the appropriate C++ library. All algorithm libraries share the same in-process database; no IPC hops between them.
 
 ```mermaid
 flowchart TB
-    PY["Python LangGraph Orchestrator"]
-    subgraph MCP["C++ MCP Server Layer<br/>(McpServerBase + ToolRegistry + ToolClient)"]
-        direction LR
-        DB[DatabaseMcpServer]
-        WIN[WindowsMcpServer<br/>Qt thread]
-        PLACE[PlacementMcpServer]
-        ROUTE[RoutingMcpServer]
-        EDIT[EditingMcpServer]
-        VIEW[ViewingMcpServer]
-    end
-    subgraph ENGINE["C++ Routing Engine Pipeline"]
+    PY["Python LangGraph Orchestrator<br/>(dual-path modules)"]
+    subgraph DAEMON["eda_daemon process (external tool layer)"]
         direction TB
-        A["DesignAnalyzer → ContextClassifier → StrategyComposer"]
-        B["GlobalPlanner (GA) → CorridorRefinement"]
-        C["SpatialPartitioner → N region workers<br/>(NegotiatedRoutingLoop + DetailedGridRouter A*<br/>+ HistoryCostUpdater + ConvergenceMonitor + IlpSolver)"]
-        D["CrossRegionMediator (barrier sync)"]
-        E["DrcPenaltyModel + ElectricalConstraintEngine"]
-        F["RouteEvaluator → AdaptivePenaltyController → OptunaTuner"]
-        A --> B --> C --> D --> E --> F
+        subgraph GATE["JSON-RPC Gateway (libmcp_servers)"]
+            direction LR
+            DB["DatabaseMcpServer<br/>db.* methods"]
+            ROUTE["RoutingMcpServer<br/>route_nets"]
+            PLACE["PlacementMcpServer<br/>place_cells"]
+            WIN["WindowsMcpServer<br/>view.* (Qt thread)"]
+        end
+        subgraph ENGINE["C++ Routing Engine Pipeline"]
+            direction TB
+            A["DesignAnalyzer → ContextClassifier → StrategyComposer"]
+            B["GlobalPlanner (GA) → CorridorRefinement"]
+            C["SpatialPartitioner → N region workers"]
+            D["CrossRegionMediator (barrier sync)"]
+            E["DrcPenaltyModel + ElectricalConstraintEngine"]
+            F["RouteEvaluator → AdaptivePenaltyController → OptunaTuner"]
+            A --> B --> C --> D --> E --> F
+        end
+        SHARED[("SharedDatabase<br/>in-process, zero-copy")]
+        GATE --> ENGINE
+        ENGINE --- SHARED
+        GATE --- SHARED
     end
 
-    PY -- JSON-RPC 2.0<br/>WS / HTTP / pybind11 --> MCP
-    MCP --> ENGINE
+    PY -- "external branch<br/>WS JSON-RPC :8080" --> GATE
 
     style PY fill:#e67e22,color:#fff
-    style MCP fill:#2ecc71,color:#fff
+    style DAEMON fill:#2ecc71,color:#fff
+    style GATE fill:#27ae60,color:#fff
     style ENGINE fill:#1e3a5f,color:#fff
+    style SHARED fill:#16a085,color:#fff
 ```
 
-### Five Strata
+The orchestrator's **internal branch** — when operating against a proprietary host — does not come through this daemon at all. It goes to the host-embedded HEA on a different port (`:18082`), deploys EUs written in the host's native scripting language, and reads results from the in-host state store. The two branches are completely independent; only the orchestrator knows both paths exist.
+
+</details>
+
+<details>
+<summary><b>3.2 The Five Strata</b></summary>
 
 The engine is organized into five responsibility strata:
 
@@ -127,20 +160,29 @@ The engine is organized into five responsibility strata:
 | 4 — Resolution Bridging | Cross-region boundary routing; barrier coordination | `CrossRegionMediator`, `SpatialPartitioner` |
 | 5 — Electrical Integrity | EM/IR-aware weight pre-compute; convergence guarantee | `ElectricalConstraintEngine`, `ConvergenceMonitor`, `IlpSolver` |
 
-### MCP Server Modes
+</details>
 
-| Server | Mode | Qt dispatch | Representative tools |
+<details>
+<summary><b>3.3 JSON-RPC Methods Exposed by the Daemon</b></summary>
+
+The daemon's MCP servers expose the JSON-RPC methods that the orchestrator's external branch calls. These are **not** HEA tools (`deploy_eu` / `query_state` etc. belong to the internal layer only) — they are conventional RPC entry points, one per capability.
+
+| Server | Thread affinity | Representative methods | Called by |
 |---|---|---|---|
-| `DatabaseMcpServer` | Always-on | No — direct memory | `count_nets`, `get_object_ids`, `get_netlist`, `get_bounding_box` |
-| `WindowsMcpServer` | Always-on | **Yes** — promise/future + `QueuedConnection` | `list_windows`, `get_viewport`, `get_selection` |
-| `PlacementMcpServer` | On-demand | No | `place_cells`, `set_floorplan`, `legalize_placement` |
-| `RoutingMcpServer` | On-demand | No | `route_nets`, `run_drc`, `get_routing_status` |
-| `EditingMcpServer` | On-demand | No | `modify_wire`, `delete_net`, `add_via` |
-| `ViewingMcpServer` | On-demand | No | `zoom_to`, `highlight`, `screenshot` |
+| `DatabaseMcpServer` | Worker threads — direct shared-memory access | `load_design`, `db.status`, `db.get_nets`, `db.get_bboxes` | `m3_db_subgraph.py` (external branch), and all other modules for context |
+| `RoutingMcpServer` | Worker pool via `ThreadManager` | `route_nets` | `m1_router_subgraph.py` (external branch), `w1_full_route_flow.py` |
+| `PlacementMcpServer` | Worker pool via `ThreadManager` | `place_cells` | `m2_placer_subgraph.py` (external branch), `w1_full_route_flow.py` |
+| `WindowsMcpServer` | **Qt main thread** via `QMetaObject::invokeMethod` | `view.zoom_to`, `view.refresh`, `list_windows` | `m4_window_subgraph.py` (KLayout-only external branch) |
+
+Thread-affinity rules are enforced by each server's `dispatch_tool()` override. `WindowsMcpServer` is the only one that marshals calls onto the Qt GUI thread; see §11.2 for the pattern.
+
+**Cross-check workflows.** In the architecture's `BOTH` policy mode or when `analyze_internal_result` triggers augmentation, the orchestrator may call `route_nets` or `place_cells` on this daemon even after already running the equivalent EU inside a proprietary host. The daemon has no awareness of this — it just services the request. The orchestrator's `merge_and_format` step is what compares the two results.
+
+</details>
 
 ---
 
-## 3. Library Map
+## 4. Library Map
 
 Thirteen libraries. Build order is topological; each is a `.a` static archive except `libpybindings.so`. Paths are relative to `vlsi/eda_tools/routing_genetic_astar/`.
 
@@ -211,7 +253,7 @@ graph LR
 
 
 
-## 4. Directory Layout
+## 5. Directory Layout
 
 All paths relative to `vlsi/eda_tools/routing_genetic_astar/`. Shape mirrors the library map from §3.
 
@@ -249,7 +291,7 @@ tests/
 
 
 
-## 5. Library Reference
+## 6. Library Reference
 
 Each library is collapsed. Click to expand the classes you care about.
 
@@ -566,7 +608,7 @@ public:
 
 ---
 
-## 6. C++ Features Guide
+## 7. C++ Features Guide
 
 Analogies first — then the reference table.
 
@@ -624,7 +666,7 @@ Universal version-check idiom used throughout every header:
 
 ---
 
-## 7. Design Patterns Guide
+## 8. Design Patterns Guide
 
 <details>
 <summary><b>Pattern reference table</b></summary>
@@ -652,7 +694,7 @@ Universal version-check idiom used throughout every header:
 
 
 
-## 8. Threading Guide
+## 9. Threading Guide
 
 > **The one rule.** Only `threading/thread_manager.hpp` (and its `.inl` / `.cpp`) may `#include <thread>`, `<barrier>`, `<latch>`, or `<mutex>`. Every other class receives a `ThreadManager&`. Violations fail code review.
 
@@ -724,7 +766,7 @@ flowchart LR
 
 
 
-## 9. Python Bindings
+## 10. Python Bindings
 
 pybind11 was chosen: Apache 2.0 license, header-only, industry standard (PyTorch, TensorFlow, NumPy), C++17/23 compatible, cross-platform.
 
@@ -790,9 +832,11 @@ print(client.call("count_nets", {}))
 
 ---
 
-## 10. Transport / WebSocket
+## 11. Transport / WebSocket
 
-### 10.1 JSON-RPC 2.0 message shape
+This is the wire protocol the orchestrator's **external-branch** modules use to reach the daemon. The internal branch (HEA on port `:18082`) uses a separate MCP over WebSocket and is not this transport — see `architecture.md` §7.3.
+
+### 11.1 JSON-RPC 2.0 message shape
 
 ```jsonc
 // Request
@@ -856,7 +900,7 @@ tm_.submit([&] { ioc.run(); });   // I/O thread via ThreadManager — never dire
 
 ---
 
-## 11. Build System
+## 12. Build System
 
 | Target | Action |
 |---|---|
@@ -866,9 +910,14 @@ tm_.submit([&] { ioc.run(); });   // I/O thread via ThreadManager — never dire
 | `make test-<mod>` | Module-specific tests (e.g. `make test-threading`) |
 | `make format` | `clang-format` on all headers and sources |
 | `make lint` | `clang-tidy` on all sources |
-| `make docker-build` | Rebuild `cpp-linux-dev` Docker image |
-| `make ci` | docker-build + run `all test-all BUILD_MODE=release` |
+| `make docker-build` | Build multi-stage Docker image (`vlsi-agent:latest`) — compiles C++ in builder stage and copies binary into the final Python image |
+| `make docker-push` | Tag and push `vlsi-agent:latest` to the configured registry |
+| `make ci` | docker-build + run `all test-all BUILD_MODE=release` inside container |
 | `make clean` | Remove build artifacts |
+
+The Docker image uses a two-stage build:
+1. **Builder stage** (`FROM gcc:13`) — compiles the C++ daemon with all dependencies; produces `eda_daemon` static binary.
+2. **Runtime stage** (`FROM python:3.12-slim`) — installs the Python agent, copies `eda_daemon` binary, and sets the default entrypoint to `server.py`. The same image also serves the `eda_daemon` and `constraints` compose services via `command:` overrides.
 
 <details>
 <summary><b>Compiler variables and flags</b></summary>
@@ -905,7 +954,7 @@ endif
 
 ---
 
-## 12. Implementation Roadmap
+## 13. Implementation Roadmap
 
 Build libraries in dependency order. Each step unlocks a capability — ship incrementally.
 
@@ -923,12 +972,14 @@ Build libraries in dependency order. Each step unlocks a capability — ship inc
 | 10 | `libconstraints` (`ElectricalConstraintEngine`) | EM/IR correctness for advanced nodes |
 | 11 | `libeco` | Production ECO flow |
 | 12 | `libevaluation` | Scoring + adaptive tuning + Optuna |
-| 13 | `libtransport` + `libmcp_base` + `libmcp_servers` | LangGraph can now drive the engine via JSON-RPC |
+| 13 | `libtransport` + `libmcp_base` + `libmcp_servers` | **External tool layer online.** LangGraph's external-branch modules can drive the engine via JSON-RPC on `:8080` |
 | 14 | `libpybindings.so` | Full Python API + NumPy + Optuna callbacks |
+
+> **Out of scope for this roadmap:** the HEA implementations that enable the orchestrator's **internal** branch (Virtuoso SKILL loader, ICC2 Tcl loader, KLayout PyQt loader). Those are a separate workstream tracked in `vlsi/agent/src/hea/` and in `architecture.md` §10.5. The C++ daemon delivered by this roadmap is fully usable without any HEA — it covers `EXTERNAL_ONLY` workflows immediately and the external half of `AUTO` / `BOTH` workflows once the HEA ships.
 
 ---
 
-## 13. Verification Plan
+## 14. Verification Plan
 
 ### Unit Tests — Catch2 (one `.cpp` per class)
 
