@@ -23,6 +23,15 @@ The two layers cooperate under the orchestrator's routing policy (`AUTO` / `INTE
 
 > **What this document does not cover:** the HEA implementations (SKILL / Tcl / PyQt) that live inside proprietary hosts, the EU registry (Jinja2 templates), the EU compiler node, or the policy router — all of those belong to the Python agent layer and are covered in `architecture.md` §10 and the companion `hea/` source tree.
 
+**Dual-output model (as of current architecture):** For every routing / placement job, the daemon now produces two outputs written to the shared bind-mount volume (`/eda_share/`):
+
+| Output file | Format | Consumer | Purpose |
+|---|---|---|---|
+| `delta_{job_id}.bin` | Custom flat binary (see `architecture.md §14.6`) | HEA EU (Phase 5 apply loop) | Fast bulk write into the live EDA DB — ~20 B/shape, read by a short SKILL/Tcl parser |
+| `routing_{job_id}.oas` | OASIS (open standard) | KLayout DRC service + noVNC debug viewer | Geometric DRC check and visual inspection before the live DB is touched |
+
+The OASIS writer is implemented in `vlsi/eda_tools/eda_cli/oasis_writer.cpp` using a minimal streaming OASIS encoder (no library dependency — OASIS is a well-documented binary format). See §14 (below in this section) for the format specification.
+
 ---
 
 ## Contents
@@ -904,20 +913,59 @@ tm_.submit([&] { ioc.run(); });   // I/O thread via ThreadManager — never dire
 
 | Target | Action |
 |---|---|
-| `make all` | Build all 13 libs + `pybindings.so` in dependency order |
+| `make all` | Build all 13 libs + `pybindings.so` + `oasis_writer` in dependency order |
 | `make lib<name>` | Build individual library |
+| `make liboasis` | Build the standalone OASIS streaming writer (`libeda_oasis.a`) |
 | `make test-all` | Catch2 unit tests + pytest integration tests |
 | `make test-<mod>` | Module-specific tests (e.g. `make test-threading`) |
+| `make test-oasis` | OASIS writer round-trip tests (write → read back with KLayout) |
 | `make format` | `clang-format` on all headers and sources |
 | `make lint` | `clang-tidy` on all sources |
-| `make docker-build` | Build multi-stage Docker image (`vlsi-agent:latest`) — compiles C++ in builder stage and copies binary into the final Python image |
-| `make docker-push` | Tag and push `vlsi-agent:latest` to the configured registry |
-| `make ci` | docker-build + run `all test-all BUILD_MODE=release` inside container |
+| `make docker-build` | Build multi-stage Docker image (`vlsi-agent:latest`) — compiles C++ in builder stage, copies `eda_daemon` binary into the Python runtime image |
+| `make docker-klayout` | Build the KLayout + noVNC sidecar image (`vlsi-klayout:latest`) from `docker/klayout/Dockerfile` |
+| `make docker-push` | Tag and push both images to the configured registry |
+| `make ci` | docker-build + docker-klayout + `all test-all BUILD_MODE=release` inside container |
 | `make clean` | Remove build artifacts |
 
-The Docker image uses a two-stage build:
-1. **Builder stage** (`FROM gcc:13`) — compiles the C++ daemon with all dependencies; produces `eda_daemon` static binary.
-2. **Runtime stage** (`FROM python:3.12-slim`) — installs the Python agent, copies `eda_daemon` binary, and sets the default entrypoint to `server.py`. The same image also serves the `eda_daemon` and `constraints` compose services via `command:` overrides.
+The main Docker image uses a two-stage build:
+1. **Builder stage** (`FROM gcc:13`) — compiles all C++ libraries and the `eda_daemon` binary with all dependencies including `libeda_oasis.a`.
+2. **Runtime stage** (`FROM python:3.12-slim`) — installs the Python agent, copies `eda_daemon`, sets the default entrypoint to `server.py`. The same image also serves `eda_daemon` and `constraints` compose services via `command:` overrides.
+
+The KLayout image (`docker/klayout/Dockerfile`) is a separate image:
+- Base: `FROM ubuntu:22.04`
+- Installs: KLayout (`.deb` from GitHub releases), Xvfb, x11vnc, noVNC
+- Entrypoint: `start-klayout-vnc.sh` — starts Xvfb, launches KLayout in GUI mode, starts x11vnc + noVNC websockify on `:6080`
+- Also exposes a minimal HTTP server on `:8000` that accepts `POST /run_drc` and `POST /open` commands
+
+<details>
+<summary><b>OASIS writer — design notes</b></summary>
+
+`vlsi/eda_tools/eda_cli/oasis_writer.cpp` implements a streaming OASIS encoder with no external library dependency. OASIS (Open Artwork System Interchange Standard — SEMI P39) uses a straightforward binary encoding:
+
+- **Records** are typed with a 1-byte record type followed by packed fields
+- **Coordinates** are delta-encoded relative to the previous shape on the same layer (reduces file size 3–5×)
+- **String tables** hold layer names and net names; shapes reference them by index
+- **CRC32** appended at file end for integrity verification
+
+The writer is append-only (streaming): the daemon calls `OASISWriter::begin_cell()`, then `OASISWriter::write_path()` / `write_rect()` in a loop, then `OASISWriter::end_cell()`. No random access to the file is needed, so memory usage is O(1) regardless of shape count.
+
+```cpp
+// eda_cli/oasis_writer.h
+class OASISWriter {
+public:
+    explicit OASISWriter(const std::string& path);
+    void begin_cell(std::string_view cell_name);
+    void write_rect(int layer, int purpose, int32_t x, int32_t y,
+                    int32_t w, int32_t h, std::string_view net = "");
+    void write_path(int layer, int purpose,
+                    std::span<const std::pair<int32_t,int32_t>> points,
+                    int32_t half_width, std::string_view net = "");
+    void end_cell();
+    void finish();  // writes string tables + CRC, closes file
+};
+```
+
+</details>
 
 <details>
 <summary><b>Compiler variables and flags</b></summary>

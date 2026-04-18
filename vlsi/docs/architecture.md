@@ -34,6 +34,7 @@ This policy is the single source of truth for tool dispatch — see [§4 Tool La
 11. [Appendices](#11-appendices)
 12. [RAG Memory System](#12-rag-memory-system)
 13. [Docker Deployment](#13-docker-deployment)
+14. [Geometry-Level DRC and Write Protocol](#14-geometry-level-drc-and-write-protocol)
 
 ---
 
@@ -46,24 +47,31 @@ flowchart LR
     User([User])
     Dock["Host dock\n(KLayout / Virtuoso / ICC2)"]
     HEA["Host Execution Agent\n(in-host, EUs)"]
+    Share[("/eda_share\nbind-mount")]
 
     subgraph DC["🐳 Docker Container"]
         API["FastAPI :8000\n/chat"]
         G["LangGraph\nOrchestrator"]
-        P{"Policy\nrouter\n+ RAG select"}
+        P{"Policy router\n+ RAG select\n+ DRC gate"}
         SS["Script Synthesis\n(RAG→LLM→REPL)"]
         CDB[("ChromaDB\n:8001")]
-        D["eda_daemon\n:8080 WebSocket"]
+        D["eda_daemon\n:8080\n(routes + OASIS writer)"]
+        KL["KLayout\nDRC + viewer\n:6080 noVNC"]
     end
 
     User --> Dock
-    Dock -- "HTTP POST\n(host→container)" --> API
+    Dock -- "HTTP POST" --> API
     API --> G --> P
-    P -- "RAG tool\nselect" --> CDB
-    P -- "internal\n(script synthesis)" --> SS
+    P -- "RAG select" --> CDB
+    P -- "internal" --> SS
     SS --> CDB
     SS -- "EU deploy" --> HEA
-    P -- "external / fallback" --> D
+    P -- "external / route" --> D
+    D -- "binary delta\n+ OASIS" --> Share
+    Share -- "read delta" --> HEA
+    P -- "DRC check" --> KL
+    KL -- "reads OASIS" --> Share
+    KL -- "violations JSON" --> P
     HEA --> G
     D --> G
     G --> API --> Dock --> User
@@ -75,10 +83,11 @@ flowchart LR
     style D fill:#2ecc71,color:#fff
     style Dock fill:#4a90d9,color:#fff
     style CDB fill:#1a6b9a,color:#fff
+    style KL fill:#c0392b,color:#fff
     style DC fill:#0d2137,color:#ccc,stroke:#3498db,stroke-width:2px
 ```
 
-**Containerised agent, host-native execution.** Everything except the EDA host and its HEA runs inside a single Docker container that ships with the tool installation. The host dock reaches into the container on port 8000; the container reaches back into the host on port 18082 to deploy EUs. The C++ daemon, ChromaDB, and (optionally) Ollama are all co-located in the container. Any of the services can be restarted without bringing the others down.
+**Containerised agent, host-native execution.** The C++ daemon now writes two outputs per job: a flat binary delta (fast, for the HEA apply loop) and an OASIS file (for KLayout DRC and the debug viewer), both on a shared bind-mount volume. The DRC gate runs KLayout headlessly inside Docker against the OASIS file before the agent ever touches the live EDA database. The noVNC viewer lets engineers inspect the routing result in a browser without needing a full EDA tool licence.
 
 ---
 
@@ -126,6 +135,16 @@ The stack is organized into an **orchestration plane** (host-agnostic) and two *
 |---|---|---|---|
 | **Script Synthesis Node** | Inside Graph A | `vlsi/agent/src/orchestrator/script_synthesis.py` | RAG retrieval → LLM synthesis → REPL dry-run → static validation pipeline; produces a ready-to-deploy EU when the registry has no matching template |
 | **Python REPL (sandbox)** | Subprocess inside container | `vlsi/agent/src/orchestrator/python_repl.py` | Executes KLayout-Python EUs in an isolated `subprocess` before they are deployed to the HEA. For SKILL / Tcl EUs syntax-only validation is used (no native interpreter in Docker). |
+
+### 3.6 Geometry engine and DRC service
+
+| Component | Process / Port | File(s) | Responsibility |
+|---|---|---|---|
+| **KLayout service** | Container · headless + VNC · `:5900` / `:6080` | `docker/klayout/` | Three roles: (1) headless geometric DRC engine against OASIS delta files; (2) graphical debug viewer accessible via browser (noVNC `:6080`); (3) optional standalone layout editor for result inspection before committing to live EDA DB |
+| **OASIS delta writer** | Inside C++ daemon | `vlsi/eda_tools/eda_cli/oasis_writer.cpp` | Writes the routing / placement result as an OASIS file to the shared volume alongside the binary delta — used as input to KLayout DRC and the debug viewer |
+| **DRC script generator** | Inside agent process | `vlsi/agent/src/drc/drc_script_gen.py` | Converts extracted techfile rules (JSON) into a KLayout Ruby DRC script; runs KLayout headlessly and parses the `.rdb` violation report back to a structured JSON |
+| **Techfile rule extractor** | HEA EU (one-shot) | `eu_registry/{host}/extract_tech_rules.{skill,tcl}.j2` | Reads `techGetLayerParamValue` (SKILL) or `tech::get_rule` (Tcl) to produce a rules JSON: `{layer, minWidth, minSpacing, minEnclosure, minArea, ...}` per layer and layer-pair |
+| **Shared volume** | Bind-mount | `/tmp/eda_share` (host) ↔ `/eda_share` (container) | Staging area for binary delta files, OASIS files, DRC scripts, and violation reports |
 
 Two auxiliary pieces extend the flow without adding processes:
 
@@ -318,9 +337,11 @@ sequenceDiagram
     participant SS as Script Synthesis
     participant REPL as Python REPL
     participant EUC as eu_compiler
+    participant D as eda_daemon
+    participant SV as /eda_share
+    participant KL as KLayout DRC
     participant HEA as HEA (in-host)
     participant M as Module / Workflow
-    participant D as eda_daemon
 
     U->>Dock: Types command
     Dock->>S: POST {"message": "..."}
@@ -334,8 +355,25 @@ sequenceDiagram
     CDB-->>RAG: top-k API doc chunks
     RAG-->>P: tool_recommendation + context
 
-    alt Internal path (AUTO / INTERNAL_ONLY)
-        P->>EUC: compile_eu(capability, params)
+    alt Internal path — routing / placement (AUTO / INTERNAL_ONLY)
+        Note over P,SV: Phase 1 — Compute (C++ daemon)
+        P->>D: route_nets / place_cells
+        D->>SV: write delta_{job}.bin + routing_{job}.oas
+        D-->>P: {job_id, shape_count}
+
+        Note over P,KL: Phase 3 — DRC gate (KLayout headless)
+        P->>G: get_tech_rules (cached or deploy extract EU)
+        P->>SV: write drc_{job}.rb (generated script)
+        P->>KL: POST /run_drc {job_id}
+        KL->>SV: klayout -b -r drc_{job}.rb → violations_{job}.rdb
+        KL-->>P: {violation_count, critical_count}
+
+        opt violations above threshold
+            Note over P,D: reroute offending nets → back to Phase 1
+        end
+
+        Note over P,HEA: Phase 4 — Pre-flight
+        P->>EUC: compile_eu(apply_binary_delta, params)
         EUC->>EUC: registry lookup → Jinja2 render
 
         opt No registry template found
@@ -352,23 +390,26 @@ sequenceDiagram
             SS-->>EUC: validated_eu_code
         end
 
-        EUC->>HEA: deploy_eu(eu_id, code, timeout_s)
-        HEA->>HEA: defer to host idle callback
-        HEA-->>EUC: {status, output_keys, wall_time_s}
-        EUC->>HEA: query_state(output_keys)
-        HEA-->>EUC: {output.* values}
+        Note over EUC,HEA: Phase 5 — Apply (HEA main-thread tight loop)
+        EUC->>HEA: write_state({delta_path})
+        EUC->>HEA: deploy_eu(open_undo_group + apply_binary_delta)
+        HEA->>SV: read delta_{job}.bin
+        HEA->>HEA: tight loop: dbCreatePath / layout.insert (zero IPC/shape)
+        HEA->>HEA: hiRedraw every 50K shapes
+        HEA->>HEA: close undo group → single Ctrl+Z
+        HEA-->>EUC: {status, shapes_applied, wall_time_s}
         EUC-->>P: internal_result
         P->>P: analyze_internal_result
 
-        opt AUTO + augmentation triggered
+        opt AUTO + external cross-check triggered
             P->>M: dispatch_external(capability, params)
             M->>D: JSON-RPC
             D-->>M: result
             M-->>P: external_result
         end
-    else External path (EXTERNAL_ONLY)
+    else External path — non-write capabilities (EXTERNAL_ONLY)
         P->>M: dispatch_external(capability, params)
-        M->>D: JSON-RPC (load_design, place_cells, ...)
+        M->>D: JSON-RPC (load_design, db.get_nets, ...)
         D-->>M: result payload
         M-->>P: external_result
     end
@@ -381,7 +422,7 @@ sequenceDiagram
     Dock-->>U: Reply + canvas update
 ```
 
-**Reading the flow.** The hot path has two LLM calls: `parse_intent` (step 4) and — when no registry template exists — the script synthesis call inside `Script Synthesis`. RAG retrieval is a fast vector search against the local ChromaDB (in-container) and adds no external network round-trips. The Python REPL dry-run (step 17) only runs for KLayout-Python EUs; SKILL and Tcl EUs get static syntax validation only. Everything else is deterministic routing and tool invocation.
+**Reading the flow.** There are two LLM calls in the hot path: `parse_intent` (step 4) and, when no registry template exists, the script synthesis LLM call. The **DRC gate** (Phase 3, steps 12–14) runs KLayout headlessly inside Docker against the OASIS file — this catches geometric violations before the live EDA database is ever touched. The **apply loop** (Phase 5, steps 20–25) runs entirely on the HEA main thread reading a compact binary file, with zero IPC round-trips per shape and a single undo-group wrap. Engineers can open `http://localhost:6080` at any point to inspect the routing OASIS in the KLayout debug viewer.
 
 ---
 
@@ -1029,18 +1070,28 @@ vlsi/agent/
       embeddings.py                    Embedding model abstraction (OpenAI / nomic)
       stubs/
         klayout_stubs.py               Mock pya API for Python REPL dry-run
+    drc/                               Geometry-level DRC (KLayout-based, no licence)
+      drc_script_gen.py                Techfile rules JSON → KLayout Ruby DRC script
+      rdb_parser.py                    KLayout .rdb violation report → JSON
+      klayout_client.py                HTTP client for KLayout DRC trigger endpoint
 
 vlsi/eda_tools/
   eda_cli/                             C++ CLI + MCP gateway (daemon)
+    oasis_writer.cpp / .h              Streaming OASIS encoder (no external dep)
   routing_genetic_astar/               router library
   eda_placer/                          placer library (WIP)
   python/constraints_tool/             Python constraints MCP server
 
 docker/
   Dockerfile                           Multi-stage build (C++ + Python + agent)
-  docker-compose.yml                   Full stack: agent, chromadb, eda_daemon, constraints, ollama*
+  docker-compose.yml                   Full stack: agent, chromadb, eda_daemon, constraints, klayout, ollama*
   chromadb/
     config.yaml                        ChromaDB server configuration
+  klayout/
+    Dockerfile                         KLayout + Xvfb + x11vnc + noVNC image
+    start-klayout-vnc.sh               Entrypoint: starts Xvfb, KLayout GUI, VNC, noVNC
+    klayout_server.py                  Minimal HTTP server for /run_drc and /open endpoints
+    drc_runner.sh                      Wrapper that calls klayout -b for headless DRC runs
   nginx/
     nginx.conf                         Optional reverse proxy (if ChromaDB is exposed)
   scripts/
@@ -1106,6 +1157,15 @@ docker/
 | **Python REPL (sandbox)** | Isolated subprocess that dry-runs KLayout-Python EU code with mocked `pya` stubs before host deploy |
 | **LLM Provider** | Configurable backend for LLM calls: commercial cloud, local Ollama, or customer NIM endpoint |
 | **RAG Ingestor** | One-shot CLI that chunks and embeds EDA vendor docs into ChromaDB at install / version-update time |
+| **Binary delta file** | Flat binary file (`delta_{job}.bin`) written by the C++ daemon to `/eda_share/`; read by the HEA EU apply loop at ~200 MB/s with zero IPC per shape |
+| **OASIS delta file** | Standard OASIS layout file (`routing_{job}.oas`) written alongside the binary delta; consumed by KLayout DRC engine and debug viewer |
+| **DRC gate** | Phase 3 of the five-phase write protocol; runs KLayout headlessly against the OASIS file before any live DB write — catches geometric violations without a proprietary DRC licence |
+| **Five-phase write protocol** | Compute → Extract rules → DRC gate → Pre-flight → Apply; the only path by which C++ routing results enter the live EDA database |
+| **KLayout service** | Docker sidecar running KLayout + Xvfb + noVNC; serves as open-source DRC engine (headless) and graphical debug viewer (browser on `:6080`) |
+| **noVNC** | Browser-based VNC client; exposes the KLayout GUI at `http://localhost:6080` without requiring a VNC client app |
+| **/eda_share** | Bind-mounted staging volume shared between all Docker services and the host; ephemeral — cleared after each job |
+| **Techfile rule extractor** | One-shot HEA EU that reads `techGetLayerParamValue` (SKILL) or `tech::get_rule` (Tcl) and returns a rules JSON used to generate the KLayout DRC script |
+| **OASIS writer** | Streaming C++ encoder in `oasis_writer.cpp`; produces standard OASIS files with delta-encoded coordinates and no external library dependency |
 
 ---
 
@@ -1218,23 +1278,33 @@ graph LR
     subgraph DC["docker-compose.yml"]
         A["agent\n:8000\nFastAPI + LangGraph"]
         CDB["chromadb\n:8001\nvector store"]
-        D["eda_daemon\n:8080\nC++ routing/placement"]
+        D["eda_daemon\n:8080\nC++ routing/placement\n+ OASIS writer"]
         C["constraints\n:18081\nSPICE parser MCP"]
+        KL["klayout\n:6080 noVNC\nDRC + viewer"]
+        SV[("/eda_share\nbind-mount\nbinary delta + OASIS")]
         O["ollama *(optional)*\n:11434\nlocal LLM"]
     end
 
     H["Host EDA tool\n(Virtuoso / ICC2 / KLayout)\n+ HEA :18082"]
     UI["User dock\n(PyQt / Tk / native)"]
+    BW["Browser\n:6080\ndebug viewer"]
 
-    UI -- "HTTP :8000\n(host→container)" --> A
+    UI -- "HTTP :8000" --> A
     A -- internal net --> CDB
     A -- internal net --> D
     A -- internal net --> C
+    A -- "DRC request" --> KL
+    D -- "writes delta + OASIS" --> SV
+    KL -- "reads OASIS" --> SV
+    SV -- "read delta" --> H
     A -. "if LLM_PROVIDER=ollama" .-> O
-    A -- "host.docker.internal:18082\n(container→host)" --> H
+    A -- "host.docker.internal:18082" --> H
+    BW -- "noVNC :6080" --> KL
 
     style DC fill:#0d2137,color:#ccc,stroke:#3498db,stroke-width:2px
     style H fill:#8e44ad,color:#fff
+    style KL fill:#c0392b,color:#fff
+    style SV fill:#555,color:#eee
 ```
 
 ### 13.2 docker-compose.yml (reference)
@@ -1263,32 +1333,51 @@ services:
       - CHROMA_URL=http://chromadb:8001
       - EDA_DAEMON_URL=ws://eda_daemon:8080
       - HEA_URL=ws://host.docker.internal:18082
-      - EDA_HOST=virtuoso                  # or icc2, klayout
+      - KLAYOUT_URL=http://klayout:8000      # KLayout DRC HTTP trigger endpoint
+      - EDA_HOST=virtuoso                    # or icc2, klayout
       - EDA_VERSION=icadvm_23_1
     volumes:
-      - eda_docs:/eda_docs:ro              # vendor doc mount (read-only)
+      - eda_docs:/eda_docs:ro                # vendor doc mount (read-only)
+      - eda_share:/eda_share                 # shared staging volume (delta + OASIS files)
     depends_on:
       - chromadb
       - eda_daemon
+      - klayout
 
   chromadb:
     image: chromadb/chroma:latest
     ports:
-      - "127.0.0.1:8001:8000"             # internal only — not exposed to LAN
+      - "127.0.0.1:8001:8000"               # internal only — not exposed to LAN
     volumes:
       - chroma_data:/chroma/chroma
 
   eda_daemon:
     image: vlsi-agent:latest
-    command: ["./eda_daemon", "--port", "8080"]
+    command: ["./eda_daemon", "--port", "8080", "--share-dir", "/eda_share"]
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      - eda_share:/eda_share                 # daemon writes binary delta + OASIS here
 
   constraints:
     image: vlsi-agent:latest
     command: ["python", "-m", "constraints_tool.mcp_server", "--port", "18081"]
     ports:
       - "127.0.0.1:18081:18081"
+
+  klayout:
+    image: vlsi-klayout:latest               # separate image: KLayout + noVNC + Xvfb
+    build: docker/klayout/
+    ports:
+      - "127.0.0.1:6080:6080"               # noVNC web viewer (browser-accessible)
+      - "127.0.0.1:5900:5900"               # raw VNC (optional, for VNC clients)
+      - "127.0.0.1:8088:8000"               # KLayout HTTP trigger endpoint (internal use)
+    environment:
+      - DISPLAY=:1
+      - VNC_PASSWORD=${VNC_PASSWORD:-eda_viewer}
+      - KLAYOUT_SHARE=/eda_share
+    volumes:
+      - eda_share:/eda_share                 # reads OASIS / DRC scripts / writes .rdb reports
 
   # Optional: local Ollama — uncomment when LLM_PROVIDER=ollama
   # ollama:
@@ -1301,6 +1390,7 @@ services:
 volumes:
   chroma_data:
   eda_docs:
+  eda_share:                                 # ephemeral staging; bind-mount /tmp/eda_share on host
   # ollama_models:
 ```
 
@@ -1311,11 +1401,18 @@ volumes:
 | User dock → agent | Host → container | `localhost:8000` → container `:8000` |
 | Agent → ChromaDB | Container → container | `http://chromadb:8001` (internal net) |
 | Agent → eda_daemon | Container → container | `ws://eda_daemon:8080` (internal net) |
+| Agent → KLayout DRC trigger | Container → container | `http://klayout:8000` (internal net) |
+| eda_daemon → shared volume | Container → volume | `/eda_share/` (writes binary delta + OASIS) |
+| KLayout → shared volume | Container → volume | `/eda_share/` (reads OASIS, writes `.rdb` violations) |
+| HEA → shared volume | Host → bind-mount | `/tmp/eda_share/` (reads binary delta on host side) |
+| Engineer browser → KLayout viewer | Host → container | `localhost:6080` → noVNC |
 | Agent → HEA | Container → host | `ws://host.docker.internal:18082` |
 | Agent → cloud LLM | Container → internet | Through host network (requires outbound HTTPS) |
 | Agent → Ollama | Container → container | `http://ollama:11434` (internal net, if enabled) |
 
 > **Linux note.** `host.docker.internal` is not available by default on Linux. Add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `agent` service, or set `HEA_URL` to the host's LAN IP.
+
+> **Shared volume note.** The `eda_share` volume is bind-mounted to `/tmp/eda_share` on the host so the HEA EU can read the binary delta file from the host filesystem. On Linux this is automatic via the bind-mount. On macOS with Docker Desktop, the `/tmp/eda_share` host path needs to be in the Docker Desktop → Settings → Resources → File Sharing allowlist.
 
 ### 13.4 LLM provider configuration
 
@@ -1358,6 +1455,261 @@ curl http://localhost:8000/health
 | `8000` | `0.0.0.0:8000` | Agent FastAPI (`/chat`, `/health`) |
 | `8001` | `127.0.0.1:8001` | ChromaDB (internal; do not expose to LAN) |
 | `8080` | `127.0.0.1:8080` | C++ `eda_daemon` |
+| `8088` | `127.0.0.1:8088` | KLayout DRC trigger HTTP (internal; mapped from container `:8000`) |
 | `18081` | `127.0.0.1:18081` | Constraints MCP |
 | `18082` | host (not in Docker) | HEA in EDA host process |
+| `5900` | `127.0.0.1:5900` | KLayout raw VNC (for VNC desktop clients) |
+| `6080` | `127.0.0.1:6080` | KLayout noVNC — open `http://localhost:6080` in browser to view layout |
 | `11434` | `127.0.0.1:11434` | Ollama (if enabled) |
+
+---
+
+## 14. Geometry-Level DRC and Write Protocol
+
+This section covers how the agent implements DRC using open-source tooling (no proprietary DRC engine licence required) and how writes are committed to the live EDA database via the five-phase protocol.
+
+### 14.1 The DRC problem and why OA techfile data is enough
+
+EDA tools store design rules as structured data in the technology file, accessible via scripting APIs:
+
+| EDA host | API to read rules | Example |
+|---|---|---|
+| Cadence Virtuoso (SKILL) | `techGetLayerParamValue` | `techGetLayerParamValue(techfile "metal1" "minWidth")` → `0.06` |
+| Synopsys ICC2 (Tcl) | `tech::get_rule` | `tech::get_rule -layer metal1 -rule min_width` → `0.064` |
+| KLayout (Python) | `tech.layer_info` / `DRCEngine` | `RBA::Technology.technology_by_name("sky130").drc_script` |
+
+The agent extracts these rules once (via a one-shot HEA EU) and stores them as a JSON rules dictionary. KLayout's built-in DRC engine — which is open-source, ships with KLayout, and runs headlessly — can then check routing results against these rules **without any proprietary DRC licence**. The checks it can run:
+
+| Check type | Covered | Notes |
+|---|---|---|
+| Minimum width (per metal layer) | Yes | Direct techfile parameter |
+| Minimum spacing (same layer, diff net) | Yes | Direct techfile parameter |
+| Minimum spacing (same layer, same net) | Yes | Optional; some PDKs define this |
+| Enclosure (via inside metal) | Yes | Per via-metal layer pair |
+| Extension (metal beyond via edge) | Yes | Per via-metal layer pair |
+| Minimum area | Yes | Direct techfile parameter |
+| Off-grid shapes | Yes | Grid derived from manufacture grid in techfile |
+| Short circuit (overlap of diff-net shapes) | Yes | Geometric intersection check |
+| **Antenna rules** | No — requires net topology | Complex; needs LVS-level extraction |
+| **CMP density** | Partial — simple window | Full CMP rules need proprietary engine |
+| **Multi-patterning** | No | Requires proprietary coloring engine |
+| **Electrical rules (ERC)** | No — requires SPICE | Out of scope for geometric DRC |
+
+For the agent's routing feedback loop, the geometric checks above catch the vast majority of DRC violations produced by the C++ router — width, spacing, enclosure, and shorts are the dominant failure modes.
+
+### 14.2 Techfile rule extraction (one-shot HEA EU)
+
+The rule extractor EU runs once per design session and stores the rules in the agent's state. Rules are re-extracted only when the technology changes.
+
+**SKILL EU — `extract_tech_rules.skill.j2`** (excerpt):
+
+```
+let((tf rules layerList)
+    tf = techGetTechFile(geGetEditCellView())
+    layerList = techGetLayerNames(tf)
+    rules = list()
+
+    foreach(layer layerList
+        let((minW minS minA)
+            minW = techGetLayerParamValue(tf layer "minWidth")
+            minS = techGetLayerParamValue(tf layer "minSpacing")
+            minA = techGetLayerParamValue(tf layer "minArea")
+            when(minW
+                rules = append1(rules
+                    list("layer" layer
+                         "minWidth" minW
+                         "minSpacing" (or minS 0.0)
+                         "minArea" (or minA 0.0)))
+            )
+        )
+    )
+    ; Via enclosure rules
+    foreach(via (techGetViaDefs tf)
+        let((viaName metals enc)
+            viaName = car(via)
+            metals = techGetViaLayerPairs(tf viaName)
+            enc = techGetLayerParamValue(tf viaName "minEnclosure")
+            rules = append1(rules
+                list("via" viaName "metals" metals "minEnclosure" (or enc 0.0)))
+        )
+    )
+    euStateSet("output.tech_rules" (buildString (mapcar 'tostring rules) " "))
+)
+```
+
+The agent's `drc_script_gen.py` parses this JSON and generates a KLayout Ruby DRC script on the fly.
+
+### 14.3 KLayout DRC script generation
+
+```python
+# vlsi/agent/src/drc/drc_script_gen.py
+
+KLAYOUT_DRC_TEMPLATE = """\
+# Auto-generated from OA techfile rules — do not edit
+source($input, $top_cell)
+
+{% for rule in layer_rules %}
+{{ rule.layer_slug }} = input({{ rule.gds_layer }}, {{ rule.gds_purpose }})
+{{ rule.layer_slug }}.width({{ rule.minWidth }}.um).output("{{ rule.layer }} min width", "{{ rule.layer }}.W.1")
+{% if rule.minSpacing > 0 %}
+{{ rule.layer_slug }}.space({{ rule.minSpacing }}.um).output("{{ rule.layer }} min spacing", "{{ rule.layer }}.S.1")
+{% endif %}
+{% if rule.minArea > 0 %}
+{{ rule.layer_slug }}.area({{ rule.minArea }}.um2).output("{{ rule.layer }} min area", "{{ rule.layer }}.A.1")
+{% endif %}
+{% endfor %}
+
+{% for via_rule in via_rules %}
+{{ via_rule.via_slug }} = input({{ via_rule.gds_layer }}, 0)
+{{ via_rule.metal_below_slug }}.enclosing({{ via_rule.via_slug }}, {{ via_rule.minEnclosure }}.um) \\
+    .output("{{ via_rule.via }} enclosure in {{ via_rule.metal_below }}", "{{ via_rule.via }}.ENC.1")
+{% endfor %}
+
+# Short circuit check — shapes from different nets overlapping on same layer
+{% for layer_slug in all_layer_slugs %}
+{{ layer_slug }}.merged.drc(width < 0).output("Short circuit on {{ layer_slug }}", "{{ layer_slug }}.SHORT.1")
+{% endfor %}
+
+report("DRC Report", $output)
+"""
+
+def generate_drc_script(tech_rules: dict, layer_map: dict) -> str:
+    """tech_rules: from extract_tech_rules EU; layer_map: GDS layer numbers from techfile"""
+    ...
+```
+
+### 14.4 Running KLayout DRC headlessly
+
+```bash
+# Called by agent via HTTP trigger to the klayout service, or directly via subprocess
+klayout -b \
+    -r /eda_share/drc_{job_id}.rb \
+    -rd input=/eda_share/routing_{job_id}.oas \
+    -rd output=/eda_share/violations_{job_id}.rdb \
+    -rd top_cell=MYDESIGN
+```
+
+The `.rdb` (report database) is an XML format KLayout writes natively. The agent parses it:
+
+```python
+# vlsi/agent/src/drc/rdb_parser.py
+def parse_rdb(path: str) -> list[DRCViolation]:
+    """Returns [{rule, layer, category, bbox, count}] sorted by severity."""
+    ...
+```
+
+### 14.5 Five-phase write protocol
+
+This is the recommended write protocol from the architecture analysis. The DRC gate in Phase 3 is the key addition — no change is committed to the live EDA database until KLayout reports a clean result (or violations are below the user's accepted threshold).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as Graph A
+    participant D as eda_daemon
+    participant SV as /eda_share
+    participant KL as KLayout (Docker)
+    participant P as Policy router
+    participant HEA as HEA (in-host)
+
+    Note over G,D: Phase 1 — Compute
+    G->>D: route_nets(design, constraints)
+    D->>D: run router algorithm
+    D->>SV: write delta_{job}.bin  (binary delta)
+    D->>SV: write routing_{job}.oas  (OASIS for DRC/viewer)
+    D-->>G: {job_id, shape_count, wire_length_um}
+
+    Note over G,KL: Phase 2 — Extract rules (once per session)
+    G->>HEA: deploy_eu(extract_tech_rules)
+    HEA-->>G: {tech_rules JSON}
+
+    Note over G,KL: Phase 3 — DRC gate (KLayout headless)
+    G->>G: drc_script_gen(tech_rules) → drc_{job}.rb
+    G->>SV: write drc_{job}.rb
+    G->>KL: POST /run_drc {job_id, top_cell}
+    KL->>SV: klayout -b -r drc_{job}.rb
+    KL->>SV: write violations_{job}.rdb
+    KL-->>G: {violation_count, critical_count}
+
+    alt violations > threshold
+        G->>G: analyze violations → reroute offending nets
+        G->>D: route_nets(offending_nets, stricter_constraints)
+        Note over D,KL: back to Phase 1 for affected nets
+    end
+
+    Note over G,HEA: Phase 4 — Pre-flight (HEA EU)
+    G->>HEA: deploy_eu(snapshot_and_open_undo_group)
+    HEA->>HEA: snapshot DB stamp; hiUndoGroupBegin("Route")
+    HEA-->>G: {snapshot_id, undo_open: true}
+
+    Note over HEA,SV: Phase 5 — Apply (HEA EU, main thread tight loop)
+    G->>HEA: write_state({delta_path: "/tmp/eda_share/delta_{job}.bin"})
+    G->>HEA: deploy_eu(apply_binary_delta)
+    HEA->>SV: read delta_{job}.bin
+    HEA->>HEA: apply shapes in tight loop (dbCreatePath / layout.insert)
+    HEA->>HEA: hiRedraw every 50K shapes (progressive display)
+    HEA->>HEA: hiUndoGroupEnd()
+    HEA-->>G: {status: success, shapes_applied, wall_time_s}
+    G->>SV: delete delta_{job}.bin + routing_{job}.oas
+```
+
+**Key properties:**
+- The live EDA database is **never modified** until Phase 5
+- Phases 1–3 are fully reversible — no side effects on the host
+- The DRC gate (Phase 3) catches geometric violations before they enter the undo stack
+- If the agent crashes after opening the undo group (Phase 4) but before closing it (Phase 5), the host tool detects an orphaned undo group on the next operation and can roll it back
+
+### 14.6 Binary delta format
+
+The C++ daemon writes a flat binary file. The format is intentionally minimal so it can be parsed by a short SKILL/Tcl reader without a library dependency:
+
+```
+Header (16 bytes):
+  magic[4]    = 0x45444144  ("EDAD")
+  version[2]  = 1
+  shape_count[4]
+  reserved[6]
+
+Per-shape record (variable length):
+  layer_idx[2]     — index into layer table at end of file
+  net_idx[2]       — index into net name table at end of file
+  shape_type[1]    — 0=rect, 1=path, 2=polygon
+  coord_count[2]   — number of (x,y) pairs
+  coords[coord_count * 2 * 4]  — int32 in nm (database units)
+
+Footer:
+  layer_table: null-terminated name strings
+  net_table:   null-terminated name strings
+  crc32[4]
+```
+
+At 20 bytes average per shape (3 path points), 1M shapes = **~20 MB uncompressed** or **~8 MB with LZ4**. The SKILL binary reader is ~80 lines using SKILL's `getIntFromFile` / `readString` primitives.
+
+### 14.7 KLayout debug viewer
+
+The KLayout service runs Xvfb + KLayout in GUI mode + noVNC, accessible at `http://localhost:6080`. Use cases:
+
+- **Pre-commit inspection** — open `routing_{job}.oas` before Phase 5 to manually verify the routing result
+- **Violation highlighting** — open the OASIS file alongside the `.rdb` violation report; KLayout displays violations as colored markers
+- **Script debugging** — edit and run SKILL-equivalent Python scripts in KLayout against the OASIS layout without touching the live EDA session
+- **Regression snapshots** — dump OASIS after each routing iteration; compare with KLayout's `diff_cell` function
+
+```bash
+# Open a specific OASIS file in the KLayout viewer (from host)
+curl -X POST http://localhost:8088/open \
+     -d '{"file": "/eda_share/routing_001.oas", "top_cell": "MYDESIGN"}'
+# Browser opens http://localhost:6080 → see the routing result immediately
+```
+
+### 14.8 What this does NOT replace
+
+The KLayout DRC path handles geometric checks on the routing delta. It does not replace:
+
+| Proprietary capability | Why it still needs the host tool |
+|---|---|
+| Full-chip signoff DRC (Calibre, Pegasus) | Handles complex multi-patterning, CMP density, parametric rules, antenna — required for tape-out |
+| LVS (Layout vs. Schematic) | Requires full netlist extraction tied to schematic; KLayout can do LVS too but needs accurate schematic CDL |
+| PEX (Parasitic extraction) | Requires field-solver or table-based extractor with foundry sign-off |
+| Timing closure / STA | Requires PEX + liberty models |
+
+The agent's KLayout DRC is the **fast inner-loop check** in the DRC fix loop (`w2_drc_fix_loop`). Calibre/Pegasus sign-off DRC is run by the engineer at the end of the P&R flow using the host's native DRC launcher — that call can also be triggered via a HEA EU when the agent decides the design is ready for formal sign-off.
