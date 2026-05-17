@@ -50,11 +50,11 @@ for pair in "cpp_programs:cpp_programs" "python_programs:python_programs" "secur
   nested_commit "$dir" "$label"
 done
 
-git add cpp_programs python_programs security 2>/dev/null || true
+git add -A
 if git diff --cached --quiet 2>/dev/null; then
-  echo "[programming] root: nothing to commit (gitlinks unchanged)"
+  echo "[programming] root: nothing to commit"
 else
-  git commit -m "$MSG (root pointers)"
+  git commit -m "$MSG (root)"
   echo "[programming] root committed"
 fi
 

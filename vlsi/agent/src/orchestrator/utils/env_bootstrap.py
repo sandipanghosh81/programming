@@ -1,9 +1,13 @@
 """
-Load secrets from vlsi/agent/.env before any ChatGoogleGenerativeAI is constructed.
+Load secrets before any ChatGoogleGenerativeAI is constructed.
+
+Load order (later overrides earlier):
+  1. /Users/sandipanghosh/programming/.env  — workspace-wide shared keys
+  2. vlsi/agent/.env                         — project-specific overrides
 
 python-dotenv defaults to override=False, so an empty GOOGLE_API_KEY in the
-shell would prevent .env from taking effect. We use override=True for the
-agent .env file and mirror GOOGLE_API_KEY <-> GEMINI_API_KEY.
+shell would prevent .env from taking effect. We use override=True for both
+files and mirror GOOGLE_API_KEY <-> GEMINI_API_KEY.
 """
 
 from __future__ import annotations
@@ -23,6 +27,12 @@ def load_agent_env() -> None:
         from dotenv import load_dotenv
     except ImportError:
         return
+
+    root_env = Path("/Users/sandipanghosh/programming/.env")
+    if root_env.is_file():
+        load_dotenv(root_env, override=True)
+    else:
+        logger.warning("No root .env at %s — shared keys may be missing.", root_env)
 
     env_path = _AGENT_DIR / ".env"
     if env_path.is_file():

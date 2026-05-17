@@ -17,8 +17,8 @@
 | **5. Testing iterations** | **Codex** (via **ChatGPT Plus**) | **Default / auto frontier** (do not pick a smaller model) | **`qwen2.5-coder:32b`** | Test runs and retries burn **ChatGPT/Codex** quota, **not** Cursor — protects 4–6 h Cursor days. Local: code + log reasoning when cloud/offline. |
 | **6. Code review** | **Cursor Pro+** | **Claude Opus** | **`qwen2.5-coder:32b`** | Second fixed Opus window for merge-critical review (security, concurrency, invariants). Local: code-focused review (same as coding/testing). |
 
-**Installed Ollama models (your `ollama list`):** `gemma4:latest`, `llama3.1:70b`, `qwen2.5:32b`, `qwen2.5-coder:32b`.
+**Installed Ollama models (legacy snapshot):** `gemma4:26b`, `llama3.1:70b`, `qwen3:32b`, `qwen3-coder:30b`.
 
-**Local fallbacks (no second choice in-table):** Use **`gemma4:latest`** only when RAM/time is tight or for quick smoke prompts. Use **`qwen2.5:32b`** if **`llama3.1:70b`** is too heavy on memory for steps 1–3 (same role: general reasoning, smaller footprint).
+**Local fallbacks (no second choice in-table):** Use **`gemma4:26b`** when you want a smaller summariser/extractor. Use **`qwen3:32b`** as the general local fallback when larger models are unnecessary.
 
 **Daily rhythm (limits-safe):** **Sonnet** for steps 1, 2, and 4 across the full session. **Opus** only for step 3 and step 6 (short, focused chats). **Codex** for step 5 whenever tests run. If Cursor still feels tight, shorten Opus windows (finish architecture, then close chat; same for review) — **do not** switch steps 1–2–4 to a cheaper model; narrow `@` files and start fresh chats instead. For **offline** work, mirror the same rhythm: **`llama3.1:70b`** for 1–3, **`qwen2.5-coder:32b`** for 4–6 (use **Continue** or another Ollama-backed client, or `ollama run <model>` in terminal).
